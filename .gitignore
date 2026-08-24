@@ -1,0 +1,15 @@
+# build artifacts
+build/
+app/build/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# portable staging dir (recreated by _pack_portable.ps1; only the zip is committed)
+dist/TextureGeneratorQt/
+
+# editor
+.vscode/
+.idea/

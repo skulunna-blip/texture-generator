@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "tg_blender_link"
+version = "1.1.0"
+name = "TG Blender Link"
+tagline = "Sync PBR texture maps into Blender from a desktop app"
+maintainer = "lunna-sku <skulunna@gmail.com>"
+support = "https://github.com/skulunna-blip/texture-generator/issues"
+website = "https://github.com/skulunna-blip/texture-generator"
+type = "add-on"
+tags = ["Material", "Pipeline"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 lunna-sku"]
