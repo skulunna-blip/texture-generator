@@ -10,6 +10,9 @@
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDir>
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDropEvent>
 #include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,6 +22,7 @@
 #include <QImageReader>
 #include <QLabel>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPixmap>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -31,6 +35,7 @@
 #include <QSplitter>
 #include <QStandardItemModel>
 #include <QStandardPaths>
+#include <QStyle>
 #include <QTabBar>
 #include <QTimer>
 #include <QUrl>
@@ -209,6 +214,12 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowFlag(Qt::WindowCloseButtonHint, true);
     resize(1480, 920);
     setMinimumSize(980, 680);
+    // Dropping an image anywhere on the window loads it, the same as the
+    // Choose Image button does. QMainWindow already accepts drops by default,
+    // because it needs them for docking, so this is not what makes the feature
+    // work - it is here so the requirement is stated rather than inherited
+    // from a base-class default nobody reading this would know about.
+    setAcceptDrops(true);
 
     // Persist a user-chosen output folder across runs; empty means the default.
     QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
@@ -470,6 +481,12 @@ MainWindow::MainWindow(QWidget* parent)
             border: 1px solid #28313c;
             border-radius: 7px;
             padding: 8px;
+        }
+        // Set on the source preview while a file is dragged over the window,
+        // so the drop has somewhere visible to land.
+        QLabel#previewSurface[dropTarget="true"] {
+            background: #10222c;
+            border: 1px dashed #4fb6d8;
         }
         QLabel#statusCard {
             padding: 10px 12px;
@@ -759,10 +776,23 @@ QWidget* MainWindow::buildSidebar()
             this,
             [this](int) {
                 refreshAlgorithmSummary();
+                refreshDelightState();
                 scheduleLivePreview();
             });
     settingsLayout->addWidget(m_backendSectionLabel);
     settingsLayout->addWidget(m_backendCombo);
+
+    // Sits with the backend choice rather than down with the de-lighting
+    // controls, because it answers the same question: how much work the
+    // preview is allowed to do. Unticked, dragging a slider stays on the
+    // classical path and the depth map is computed only for the final export.
+    m_aiPreviewCheck = new QCheckBox;
+    connect(m_aiPreviewCheck, &QCheckBox::toggled, this, [this]() {
+        refreshDelightState();
+        saveDelightSettings();
+        scheduleLivePreview();
+    });
+    settingsLayout->addWidget(m_aiPreviewCheck);
 
     m_styleSectionLabel = makeRoleLabel(QStringLiteral("muted"));
     m_styleCombo = new QComboBox;
@@ -785,6 +815,47 @@ QWidget* MainWindow::buildSidebar()
     connect(m_seamlessCheck, &QCheckBox::toggled, this, &MainWindow::scheduleLivePreview);
     settingsLayout->addWidget(m_squareCheck);
     settingsLayout->addWidget(m_seamlessCheck);
+
+    // De-lighting comes first and gets its own header, because it is not one
+    // more surface-detail dial: it rewrites the source image that every later
+    // stage reads. The bump and normal sliders below are working on the
+    // de-lit result, so a reader who has them above this cannot tell which
+    // image they are describing.
+    m_delightSectionLabel = makeRoleLabel(QStringLiteral("section"));
+    settingsLayout->addWidget(m_delightSectionLabel);
+
+    // The pass itself is classical, so it works with every backend; when the
+    // neural backend has produced a depth map it is handed over as an edge
+    // guide so shading does not bleed across object outlines.
+    m_delightCheck = new QCheckBox;
+    connect(m_delightCheck, &QCheckBox::toggled, this, [this]() {
+        refreshDelightState();
+        saveDelightSettings();
+        scheduleLivePreview();
+    });
+    settingsLayout->addWidget(m_delightCheck);
+
+    auto* delightRow = new QHBoxLayout;
+    m_delightTitleLabel = makeRoleLabel(QStringLiteral("muted"));
+    m_delightValueLabel = new QLabel;
+    m_delightValueLabel->setObjectName(QStringLiteral("valueLabel"));
+    delightRow->addWidget(m_delightTitleLabel);
+    delightRow->addStretch(1);
+    delightRow->addWidget(m_delightValueLabel);
+    settingsLayout->addLayout(delightRow);
+
+    m_delightSlider = new QSlider(Qt::Horizontal);
+    m_delightSlider->installEventFilter(new WheelIgnoreFilter(m_delightSlider));
+    m_delightSlider->setRange(0, 100);
+    m_delightSlider->setValue(80);
+    connect(m_delightSlider, &QSlider::valueChanged, this, &MainWindow::updateDelightLabel);
+    connect(m_delightSlider, &QSlider::sliderPressed, this, [this]() { m_draggingPreview = true; });
+    connect(m_delightSlider, &QSlider::sliderReleased, this, [this]() {
+        m_draggingPreview = false;
+        saveDelightSettings();
+        scheduleLivePreview();
+    });
+    settingsLayout->addWidget(m_delightSlider);
 
     auto* bumpRow = new QHBoxLayout;
     m_bumpTitleLabel = makeRoleLabel(QStringLiteral("muted"));
@@ -832,6 +903,21 @@ QWidget* MainWindow::buildSidebar()
 
     updateBumpLabel(m_bumpSlider->value());
     updateNormalLabel(m_normalSlider->value());
+    updateDelightLabel(m_delightSlider->value());
+
+    // Restore the de-lighting preferences; they are written back on every
+    // change so the choice survives a restart like the output folder does.
+    {
+        QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+        const QSignalBlocker delightBlocker(m_delightCheck);
+        const QSignalBlocker sliderBlocker(m_delightSlider);
+        const QSignalBlocker previewBlocker(m_aiPreviewCheck);
+        m_delightCheck->setChecked(settings.value(QStringLiteral("delight/enabled"), false).toBool());
+        m_delightSlider->setValue(settings.value(QStringLiteral("delight/strength"), 80).toInt());
+        m_aiPreviewCheck->setChecked(settings.value(QStringLiteral("ai/preview"), false).toBool());
+    }
+    refreshDelightState();
+
     layout->addWidget(settingsPanel);
 
     // 超分放大（Real-ESRGAN）：紧跟在生成设置之后；标题按钮可折叠/展开。
@@ -1133,6 +1219,14 @@ void MainWindow::openImage()
         return;
     }
 
+    loadSourceFromPath(path);
+}
+
+// Everything a chosen image has to go through, shared by the file dialog and
+// by a drop on the window. Returns false, having said why, if the file could
+// not be read as an image.
+bool MainWindow::loadSourceFromPath(const QString& path)
+{
     QApplication::setOverrideCursor(Qt::WaitCursor);
     const QImage image = readScaledSource(path);
     QApplication::restoreOverrideCursor();
@@ -1141,7 +1235,7 @@ void MainWindow::openImage()
                              uiText(QStringLiteral("读取失败"), QStringLiteral("Read Failed")),
                              uiText(QStringLiteral("这张图片无法打开。"),
                                     QStringLiteral("The image could not be opened.")));
-        return;
+        return false;
     }
 
     m_sourcePath = path;
@@ -1163,6 +1257,72 @@ void MainWindow::openImage()
     setMessage(uiText(QStringLiteral("已载入源图，正在刷新实时预览。"),
                       QStringLiteral("Source image loaded. Refreshing the live preview.")));
     scheduleLivePreview();
+    return true;
+}
+
+// The first file in a drop that reads as an image. Taking the whole list and
+// stopping at the first usable one means a drop of several files does the
+// obvious thing instead of failing, and a drop that includes a stray folder or
+// a text file still works.
+static QString firstImageInMime(const QMimeData* mime)
+{
+    if (!mime || !mime->hasUrls()) {
+        return QString();
+    }
+    for (const QUrl& url : mime->urls()) {
+        if (!url.isLocalFile()) {
+            continue;
+        }
+        const QString path = url.toLocalFile();
+        QImageReader probe(path);
+        probe.setAutoTransform(true);
+        if (probe.canRead()) {
+            return path;
+        }
+    }
+    return QString();
+}
+
+void MainWindow::setDropHighlight(bool on)
+{
+    if (!m_inputPreviewLabel) {
+        return;
+    }
+    if (m_inputPreviewLabel->property("dropTarget").toBool() == on) {
+        return;
+    }
+    m_inputPreviewLabel->setProperty("dropTarget", on);
+    // Qt only re-evaluates a property selector when the widget is polished
+    // again; setting the property alone leaves the old border in place.
+    m_inputPreviewLabel->style()->unpolish(m_inputPreviewLabel);
+    m_inputPreviewLabel->style()->polish(m_inputPreviewLabel);
+    m_inputPreviewLabel->update();
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event)
+{
+    if (firstImageInMime(event->mimeData()).isEmpty()) {
+        return;
+    }
+    event->acceptProposedAction();
+    setDropHighlight(true);
+}
+
+void MainWindow::dragLeaveEvent(QDragLeaveEvent* event)
+{
+    setDropHighlight(false);
+    QMainWindow::dragLeaveEvent(event);
+}
+
+void MainWindow::dropEvent(QDropEvent* event)
+{
+    setDropHighlight(false);
+    const QString path = firstImageInMime(event->mimeData());
+    if (path.isEmpty()) {
+        return;
+    }
+    event->acceptProposedAction();
+    loadSourceFromPath(path);
 }
 
 void MainWindow::generateMaps()
@@ -1412,6 +1572,30 @@ void MainWindow::handleUpscaleFinished()
                       QStringLiteral("Upscaled %1x. Preview and export now use the larger maps (the normal map was resampled directly).").arg(scale)));
 }
 
+void MainWindow::saveDelightSettings()
+{
+    QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+    settings.setValue(QStringLiteral("delight/enabled"), m_delightCheck && m_delightCheck->isChecked());
+    settings.setValue(QStringLiteral("delight/strength"), m_delightSlider ? m_delightSlider->value() : 80);
+    settings.setValue(QStringLiteral("ai/preview"), m_aiPreviewCheck && m_aiPreviewCheck->isChecked());
+}
+
+void MainWindow::refreshDelightState()
+{
+    if (m_delightSlider) {
+        m_delightSlider->setEnabled(m_delightCheck && m_delightCheck->isChecked());
+    }
+
+    // The preview toggle only means something on the neural backend: it decides
+    // whether the live preview pays for inference or falls back to the classic
+    // path. Everything else ignores it.
+    if (m_aiPreviewCheck) {
+        const bool neural = selectedBackendMode() == TextureBackendMode::AiBridge
+            && TextureGenerator::isBackendAvailable(TextureBackendMode::AiBridge);
+        m_aiPreviewCheck->setEnabled(neural);
+    }
+}
+
 void MainWindow::refreshUpscaleState()
 {
     if (!m_upscaleButton || !m_upscaleStatusLabel) {
@@ -1462,6 +1646,14 @@ void MainWindow::updateBumpLabel(int value)
 {
     if (m_bumpValueLabel) {
         m_bumpValueLabel->setText(strengthText(value));
+    }
+    scheduleLivePreview();
+}
+
+void MainWindow::updateDelightLabel(int value)
+{
+    if (m_delightValueLabel) {
+        m_delightValueLabel->setText(strengthText(value));
     }
     scheduleLivePreview();
 }
@@ -1660,6 +1852,25 @@ void MainWindow::refreshUiText()
     if (m_normalTitleLabel) {
         m_normalTitleLabel->setText(uiText(QStringLiteral("法线强度"), QStringLiteral("Normal Strength")));
     }
+    if (m_delightSectionLabel) {
+        m_delightSectionLabel->setText(uiText(QStringLiteral("去光影"), QStringLiteral("De-lighting")));
+    }
+    if (m_delightCheck) {
+        m_delightCheck->setText(uiText(QStringLiteral("去掉光影（照片转标准 base color）"),
+                                       QStringLiteral("Remove Lighting (photo to true base color)")));
+        m_delightCheck->setToolTip(uiText(
+            QStringLiteral("把照片里原有的高光、阴影和环境色压平，让 base color 更接近材质本色。开启后 base color 本身就是去光影版，法线/粗糙度/AO 也全部基于它生成。"),
+            QStringLiteral("Flattens the highlights, shadows and colour cast the photo arrived with so the base color is closer to true albedo. When on, base_color.png itself becomes the de-lit version, and the normal, roughness and AO maps are all derived from it.")));
+    }
+    if (m_delightTitleLabel) {
+        m_delightTitleLabel->setText(uiText(QStringLiteral("去光影强度"), QStringLiteral("De-light Strength")));
+    }
+    if (m_aiPreviewCheck) {
+        m_aiPreviewCheck->setText(uiText(QStringLiteral("预览也使用 AI 深度"), QStringLiteral("Use AI Depth in Preview")));
+        m_aiPreviewCheck->setToolTip(uiText(
+            QStringLiteral("勾选后实时预览也会跑深度模型，所见即最终结果；不勾则预览走本地算法，保持流畅。深度图只算一次并缓存，之后拖滑块两种模式都是即时的。"),
+            QStringLiteral("Runs the depth model for the live preview too, so what you see matches the final result. Leave it off and the preview uses the local engines, which stay smooth. Either way the depth map is computed once and cached, so later slider drags are instant.")));
+    }
     if (m_blenderSectionLabel) {
         m_blenderSectionLabel->setText(uiText(QStringLiteral("Blender"), QStringLiteral("Blender")));
     }
@@ -1767,6 +1978,7 @@ void MainWindow::refreshUiText()
     refreshBlenderStatus();
     refreshResultTitle();
     refreshSizeSummary();
+    refreshDelightState();
     refreshInputPreview();
     refreshVisiblePreview();
 }
@@ -2061,6 +2273,9 @@ TextureOptions MainWindow::gatherOptions() const
     options.generateAlpha = m_alphaCheck && m_alphaCheck->isChecked();
     options.backendMode = selectedBackendMode();
     options.styleMode = selectedStyleMode();
+    options.removeLighting = m_delightCheck && m_delightCheck->isChecked();
+    options.delightStrength = m_delightSlider ? static_cast<double>(m_delightSlider->value()) / 100.0 : 0.8;
+    options.aiPreview = m_aiPreviewCheck && m_aiPreviewCheck->isChecked();
     return options;
 }
 

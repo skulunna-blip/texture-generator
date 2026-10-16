@@ -9,6 +9,14 @@ __pycache__/
 
 # portable staging dir (recreated by _pack_portable.ps1; only the zip is committed)
 dist/TextureGeneratorQt/
+dist/TextureGeneratorQt-portable/
+dist/_download/
+
+# AI depth model + ONNX Runtime binary. ~61 MB together, so they are fetched
+# with _get_depth_model.ps1 instead of living in git. The small ORT headers in
+# third_party/onnxruntime/include/ ARE committed - the build needs them.
+app/models/*.onnx
+app/third_party/onnxruntime/bin/*.dll
 
 # editor
 .vscode/

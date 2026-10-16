@@ -1,4 +1,4 @@
-# 一键发布到 GitHub。
+﻿# 一键发布到 GitHub。
 # 前提：先在浏览器 https://github.com/new 建好空仓库：
 #   - 仓库名：texture-generator（一字不差）
 #   - 可见性：Public（issues 页要公开，审核要查 bug tracker）

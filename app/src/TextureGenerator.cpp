@@ -1,5 +1,8 @@
 #include "TextureGenerator.h"
 
+#include "DepthEstimator.h"
+#include "LightingRemoval.h"
+
 #include <QDateTime>
 #include <QDir>
 
@@ -97,6 +100,77 @@ QImage boxBlurGray(const QImage& image, int radius, bool wrap)
     return dst;
 }
 
+// The same box blur as boxBlurGray, and deliberately the same shape, but the
+// result stays in float instead of being rounded into a grey image.
+//
+// The height pipeline is a chain of differences of blurs of one image, so every
+// rounding is subtracted from another rounding rather than from the signal. On a
+// smooth surface the four intermediate blurs being 8-bit accounted for the whole
+// of the normal map's detail: the shipped normal tilted 0.26 deg on average and
+// measured 0.27 deg away from the smooth field it was supposed to describe,
+// while rounding only the final output instead recovered none of it. Keeping the
+// field in float recovers all of it.
+HeightField boxBlurField(const HeightField& src, int radius, bool wrap)
+{
+    if (radius <= 0 || src.width <= 0 || src.height <= 0) {
+        return src;
+    }
+
+    const int width = src.width;
+    const int height = src.height;
+    const int pad = wrap ? radius : 0;
+    const int pw = width + 2 * pad;
+    const int ph = height + 2 * pad;
+
+    // In seamless mode the blur wraps so derived maps stay tileable; otherwise
+    // there is no padding and the window clamps at the border instead.
+    QVector<double> padded(static_cast<qsizetype>(pw) * ph, 0.0);
+    for (int y = 0; y < ph; ++y) {
+        const int sy = wrap ? wrapIndex(y - pad, height) : y;
+        for (int x = 0; x < pw; ++x) {
+            const int sx = wrap ? wrapIndex(x - pad, width) : x;
+            padded[static_cast<qsizetype>(y) * pw + x] = src.at(sx, sy);
+        }
+    }
+
+    const int stride = pw + 1;
+    QVector<double> integral(static_cast<qsizetype>(stride) * (ph + 1), 0.0);
+    for (int y = 0; y < ph; ++y) {
+        double rowSum = 0.0;
+        const qsizetype currentRow = static_cast<qsizetype>(y + 1) * stride;
+        const qsizetype previousRow = static_cast<qsizetype>(y) * stride;
+        for (int x = 0; x < pw; ++x) {
+            rowSum += padded[static_cast<qsizetype>(y) * pw + x];
+            integral[currentRow + x + 1] = integral[previousRow + x + 1] + rowSum;
+        }
+    }
+
+    HeightField out;
+    out.reset(width, height);
+    for (int y = 0; y < height; ++y) {
+        const int py = y + pad;
+        const int y0 = std::max(0, py - radius);
+        const int y1 = std::min(ph - 1, py + radius);
+        const qsizetype topRow = static_cast<qsizetype>(y0) * stride;
+        const qsizetype bottomRow = static_cast<qsizetype>(y1 + 1) * stride;
+        for (int x = 0; x < width; ++x) {
+            const int px = x + pad;
+            const int x0 = std::max(0, px - radius);
+            const int x1 = std::min(pw - 1, px + radius);
+            const int area = (x1 - x0 + 1) * (y1 - y0 + 1);
+            const double sum = integral[bottomRow + x1 + 1] - integral[topRow + x1 + 1]
+                             - integral[bottomRow + x0] + integral[topRow + x0];
+            out.at(x, y) = static_cast<float>(sum / std::max(1, area));
+        }
+    }
+    return out;
+}
+
+// The 8-bit image is an export format, not part of the computation. This is the
+// only place the height field is allowed to lose precision. Defined below
+// scaledRadius so it can use saturate().
+QImage heightFieldToImage(const HeightField& field);
+
 QString timeStampedJobId()
 {
     return QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
@@ -148,6 +222,20 @@ int scaledRadius(int baseRadius, const QImage& image)
     const double scale = static_cast<double>(side) / 1024.0;
     return std::max(1, static_cast<int>(std::round(baseRadius * scale)));
 }
+
+// The 8-bit image is an export format, not part of the computation. This is the
+// only place the height field is allowed to lose precision.
+QImage heightFieldToImage(const HeightField& field)
+{
+    QImage out(field.width, field.height, QImage::Format_Grayscale8);
+    for (int y = 0; y < field.height; ++y) {
+        uchar* line = out.scanLine(y);
+        for (int x = 0; x < field.width; ++x) {
+            line[x] = static_cast<uchar>(saturate(field.at(x, y)) * 255.0);
+        }
+    }
+    return out;
+}
 }
 
 TextureResult TextureGenerator::generate(const QImage& source, const TextureOptions& options, const QString& baseOutputDirectory)
@@ -169,7 +257,9 @@ bool TextureGenerator::isBackendAvailable(TextureBackendMode backendMode)
     case TextureBackendMode::EnhancedDetail:
         return true;
     case TextureBackendMode::AiBridge:
-        return false;
+        // The ONNX Runtime DLL and the model are both optional at run time; the
+        // UI greys the entry out and falls back when either is missing.
+        return DepthEstimator::isAvailable();
     }
 
     return false;
@@ -186,10 +276,6 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
         QDir().mkpath(result.outputDirectory);
     }
 
-    if (!isBackendAvailable(options.backendMode)) {
-        throw std::runtime_error("The AI material decomposition backend is not installed yet.");
-    }
-
     if (source.isNull() || !anyMapEnabled(options)) {
         return result;
     }
@@ -200,6 +286,31 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
     }
 
     result.size = prepared.size();
+
+    const bool wrap = options.seamless;
+
+    // The depth model is the expensive step, so it is deliberately gated: only
+    // the AI backend asks for it, and only the final generate runs it unless the
+    // user opted the preview in. Inference is cached inside DepthEstimator, so
+    // once a source has been through it, changing a slider costs nothing.
+    const bool neuralActive = options.backendMode == TextureBackendMode::AiBridge
+        && (writeFiles || options.aiPreview)
+        && DepthEstimator::isAvailable();
+    // 322 is the preview size (23 x 14) - roughly a third of the pixels of 518
+    // for a depth map that only has to look right at 512 px.
+    const QImage depth = neuralActive ? DepthEstimator::estimate(prepared, writeFiles ? 518 : 322)
+                                      : QImage();
+
+    // De-lighting replaces the base color outright, so everything downstream -
+    // bump, normal, roughness, metal, AO - is derived from the lit-free version
+    // rather than from the photo. It runs before the height map is built, and it
+    // uses the depth map purely as an edge guide when one is available.
+    if (options.removeLighting && options.delightStrength > 0.0) {
+        const QImage delit = LightingRemoval::remove(prepared, depth, options.delightStrength, wrap);
+        if (!delit.isNull()) {
+            prepared = delit;
+        }
+    }
 
     // Anime stylization targets the base color (and roughness) only: the height
     // map still derives from the original detail so the surface relief stays
@@ -217,14 +328,15 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
                    writeFiles);
     }
 
-    const bool wrap = options.seamless;
-
-    const QImage height = createHeightMap(prepared, options.bumpStrength, options.backendMode, wrap);
+    HeightField height = createHeightField(prepared, options.bumpStrength, options.backendMode, wrap);
+    if (!depth.isNull()) {
+        height = mergeDepthRelief(height, depth, options.bumpStrength, wrap);
+    }
     if (options.generateBump) {
         storeImage(result,
                    QStringLiteral("bump"),
                    QStringLiteral("bump.png"),
-                   height,
+                   heightFieldToImage(height),
                    writeFiles);
     }
 
@@ -628,40 +740,38 @@ QImage TextureGenerator::applyAnimeStyle(const QImage& image)
     return output;
 }
 
-QImage TextureGenerator::createHeightMap(const QImage& image, double strength, TextureBackendMode backendMode, bool wrap)
+HeightField TextureGenerator::createHeightField(const QImage& image, double strength, TextureBackendMode backendMode, bool wrap)
 {
-    QImage gray(image.size(), QImage::Format_Grayscale8);
+    // Luminance goes straight to float. Round-tripping it through an 8-bit grey
+    // image first used to lose a level on 26% of pixels, because
+    // luminance(c) * 255.0 lands just below c for 72 of the 256 grey values, and
+    // the cast truncated. That is a bias, not dither: the height map was built
+    // from an image that was systematically one level dark in places.
+    HeightField luma;
+    luma.reset(image.width(), image.height());
     for (int y = 0; y < image.height(); ++y) {
-        uchar* outLine = gray.scanLine(y);
         for (int x = 0; x < image.width(); ++x) {
-            const double l = luminance(image.pixel(x, y));
-            outLine[x] = static_cast<uchar>(saturate(l) * 255.0);
+            luma.at(x, y) = static_cast<float>(saturate(luminance(image.pixel(x, y))));
         }
     }
 
     // Multi-scale difference-of-Gaussians. Every blur is wrap-aware in seamless
     // mode so the height map stays tileable at its borders.
     const bool enhanced = backendMode == TextureBackendMode::EnhancedDetail;
-    const QImage blurFine = boxBlurGray(gray, scaledRadius(1, gray), wrap);
-    const QImage blurSmall = boxBlurGray(gray, scaledRadius(enhanced ? 3 : 2, gray), wrap);
-    const QImage blurMedium = boxBlurGray(gray, scaledRadius(enhanced ? 8 : 6, gray), wrap);
-    const QImage blurLarge = boxBlurGray(gray, scaledRadius(enhanced ? 20 : 12, gray), wrap);
-    QImage output(gray.size(), QImage::Format_Grayscale8);
+    const HeightField blurFine = boxBlurField(luma, scaledRadius(1, image), wrap);
+    const HeightField blurSmall = boxBlurField(luma, scaledRadius(enhanced ? 3 : 2, image), wrap);
+    const HeightField blurMedium = boxBlurField(luma, scaledRadius(enhanced ? 8 : 6, image), wrap);
+    const HeightField blurLarge = boxBlurField(luma, scaledRadius(enhanced ? 20 : 12, image), wrap);
 
-    for (int y = 0; y < gray.height(); ++y) {
-        const uchar* srcLine = gray.constScanLine(y);
-        const uchar* fineLine = blurFine.constScanLine(y);
-        const uchar* smallLine = blurSmall.constScanLine(y);
-        const uchar* mediumLine = blurMedium.constScanLine(y);
-        const uchar* largeLine = blurLarge.constScanLine(y);
-        uchar* outLine = output.scanLine(y);
-
-        for (int x = 0; x < gray.width(); ++x) {
-            const double luma = srcLine[x] / 255.0;
-            const double micro = luma - fineLine[x] / 255.0;
-            const double fine = fineLine[x] / 255.0 - smallLine[x] / 255.0;
-            const double medium = smallLine[x] / 255.0 - mediumLine[x] / 255.0;
-            const double large = mediumLine[x] / 255.0 - largeLine[x] / 255.0;
+    HeightField output;
+    output.reset(image.width(), image.height());
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const double base = luma.at(x, y);
+            const double micro = base - blurFine.at(x, y);
+            const double fine = blurFine.at(x, y) - blurSmall.at(x, y);
+            const double medium = blurSmall.at(x, y) - blurMedium.at(x, y);
+            const double large = blurMedium.at(x, y) - blurLarge.at(x, y);
 
             double merged;
             if (enhanced) {
@@ -677,34 +787,68 @@ QImage TextureGenerator::createHeightMap(const QImage& image, double strength, T
                 merged = 0.5 + fine * 1.20 + large * 0.55;
             }
 
-            const double centered = 0.5 + (merged - 0.5) * strength;
-            outLine[x] = static_cast<uchar>(saturate(centered) * 255.0);
+            output.at(x, y) = static_cast<float>(saturate(0.5 + (merged - 0.5) * strength));
         }
     }
 
     return output;
 }
 
-QImage TextureGenerator::createNormalMap(const QImage& heightMap, double strength, TextureBackendMode backendMode, bool wrap)
+HeightField TextureGenerator::mergeDepthRelief(const HeightField& heightMap, const QImage& depth, double strength, bool wrap)
 {
-    QImage src = heightMap.convertToFormat(QImage::Format_Grayscale8);
-    QImage normal(src.size(), QImage::Format_ARGB32_Premultiplied);
+    const QImage gray = depth.convertToFormat(QImage::Format_Grayscale8);
+    if (gray.width() != heightMap.width || gray.height() != heightMap.height) {
+        return heightMap;
+    }
 
-    const int width = src.width();
-    const int height = src.height();
+    HeightField depthField;
+    depthField.reset(gray.width(), gray.height());
+    for (int y = 0; y < gray.height(); ++y) {
+        const uchar* line = gray.constScanLine(y);
+        for (int x = 0; x < gray.width(); ++x) {
+            depthField.at(x, y) = line[x] / 255.0f;
+        }
+    }
+
+    // Band-pass the depth map: subtracting a wide blur removes the global
+    // gradient, which would otherwise tilt the entire surface, and leaves the
+    // object-scale relief. Both blurs wrap in seamless mode so the tiling
+    // property survives.
+    const HeightField near = boxBlurField(depthField, scaledRadius(6, gray), wrap);
+    const HeightField far = boxBlurField(depthField, scaledRadius(96, gray), wrap);
+
+    // The band is near zero for a flat depth map - the model finding no geometry
+    // is a legitimate answer, and in that case the luminance height map passes
+    // through untouched rather than being flattened by a no-op depth map.
+    constexpr double kReliefGain = 1.6;
+
+    HeightField output;
+    output.reset(heightMap.width, heightMap.height);
+    for (int y = 0; y < heightMap.height; ++y) {
+        for (int x = 0; x < heightMap.width; ++x) {
+            const double relief = near.at(x, y) - far.at(x, y);
+            output.at(x, y) = static_cast<float>(saturate(heightMap.at(x, y) + relief * kReliefGain * strength));
+        }
+    }
+    return output;
+}
+
+QImage TextureGenerator::createNormalMap(const HeightField& heightMap, double strength, TextureBackendMode backendMode, bool wrap)
+{
+    const int width = heightMap.width;
+    const int height = heightMap.height;
+    QImage normal(width, height, QImage::Format_ARGB32_Premultiplied);
+    if (width <= 0 || height <= 0) {
+        return normal;
+    }
+
     const double scale = backendMode == TextureBackendMode::EnhancedDetail ? strength * 2.35 : strength * 2.0;
 
     auto sample = [&](int x, int y) {
-        int sx = x;
-        int sy = y;
         if (wrap) {
-            sx = wrapIndex(x, width);
-            sy = wrapIndex(y, height);
-        } else {
-            sx = std::clamp(x, 0, width - 1);
-            sy = std::clamp(y, 0, height - 1);
+            return static_cast<double>(heightMap.at(wrapIndex(x, width), wrapIndex(y, height)));
         }
-        return src.constScanLine(sy)[sx] / 255.0;
+        return static_cast<double>(heightMap.at(std::clamp(x, 0, width - 1), std::clamp(y, 0, height - 1)));
     };
 
     for (int y = 0; y < height; ++y) {
@@ -736,16 +880,13 @@ QImage TextureGenerator::createNormalMap(const QImage& heightMap, double strengt
     return normal;
 }
 
-QImage TextureGenerator::createRoughnessMap(const QImage& image, const QImage& heightMap, TextureBackendMode backendMode, bool wrap)
+QImage TextureGenerator::createRoughnessMap(const QImage& image, const HeightField& heightMap, TextureBackendMode backendMode, bool wrap)
 {
-    const QImage fineBlur = boxBlurGray(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 1 : 2, heightMap), wrap);
-    const QImage broadBlur = boxBlurGray(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 16 : 12, heightMap), wrap);
+    const HeightField fineBlur = boxBlurField(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 1 : 2, image), wrap);
+    const HeightField broadBlur = boxBlurField(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 16 : 12, image), wrap);
     QImage output(image.size(), QImage::Format_Grayscale8);
 
     for (int y = 0; y < image.height(); ++y) {
-        const uchar* heightLine = heightMap.constScanLine(y);
-        const uchar* fineLine = fineBlur.constScanLine(y);
-        const uchar* broadLine = broadBlur.constScanLine(y);
         uchar* outLine = output.scanLine(y);
 
         for (int x = 0; x < image.width(); ++x) {
@@ -754,8 +895,8 @@ QImage TextureGenerator::createRoughnessMap(const QImage& image, const QImage& h
             const double maxChannel = std::max({color.redF(), color.greenF(), color.blueF()});
             const double minChannel = std::min({color.redF(), color.greenF(), color.blueF()});
             const double saturation = maxChannel > 0.0001 ? (maxChannel - minChannel) / maxChannel : 0.0;
-            const double microContrast = std::abs(heightLine[x] - fineLine[x]) / 255.0;
-            const double macroContrast = std::abs(heightLine[x] - broadLine[x]) / 255.0;
+            const double microContrast = std::abs(heightMap.at(x, y) - fineBlur.at(x, y));
+            const double macroContrast = std::abs(heightMap.at(x, y) - broadBlur.at(x, y));
             const double highlight = saturate((luma - 0.62) * (1.0 - saturation) * 1.9);
 
             double roughness = 0.32
@@ -814,24 +955,21 @@ QImage TextureGenerator::createMetalMap(const QImage& image, const QImage& rough
     return output;
 }
 
-QImage TextureGenerator::createAoMap(const QImage& image, const QImage& heightMap, TextureBackendMode backendMode, bool wrap)
+QImage TextureGenerator::createAoMap(const QImage& image, const HeightField& heightMap, TextureBackendMode backendMode, bool wrap)
 {
     Q_UNUSED(image)
 
-    const QImage midBlur = boxBlurGray(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 8 : 6, heightMap), wrap);
-    const QImage largeBlur = boxBlurGray(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 24 : 18, heightMap), wrap);
-    QImage output(heightMap.size(), QImage::Format_Grayscale8);
+    const HeightField midBlur = boxBlurField(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 8 : 6, image), wrap);
+    const HeightField largeBlur = boxBlurField(heightMap, scaledRadius(backendMode == TextureBackendMode::EnhancedDetail ? 24 : 18, image), wrap);
+    QImage output(QSize(heightMap.width, heightMap.height), QImage::Format_Grayscale8);
 
-    for (int y = 0; y < heightMap.height(); ++y) {
-        const uchar* baseLine = heightMap.constScanLine(y);
-        const uchar* midLine = midBlur.constScanLine(y);
-        const uchar* largeLine = largeBlur.constScanLine(y);
+    for (int y = 0; y < heightMap.height; ++y) {
         uchar* outLine = output.scanLine(y);
 
-        for (int x = 0; x < heightMap.width(); ++x) {
-            const double heightValue = baseLine[x] / 255.0;
-            const double cavity = saturate((midLine[x] / 255.0 - heightValue) * (backendMode == TextureBackendMode::EnhancedDetail ? 1.6 : 1.35));
-            const double basin = saturate((largeLine[x] / 255.0 - heightValue) * (backendMode == TextureBackendMode::EnhancedDetail ? 1.32 : 1.1));
+        for (int x = 0; x < heightMap.width; ++x) {
+            const double heightValue = heightMap.at(x, y);
+            const double cavity = saturate((midBlur.at(x, y) - heightValue) * (backendMode == TextureBackendMode::EnhancedDetail ? 1.6 : 1.35));
+            const double basin = saturate((largeBlur.at(x, y) - heightValue) * (backendMode == TextureBackendMode::EnhancedDetail ? 1.32 : 1.1));
             double ao = 1.0 - cavity * 0.72 - basin * 0.48;
             if (backendMode == TextureBackendMode::EnhancedDetail) {
                 ao = 1.0 - cavity * 0.82 - basin * 0.56;

@@ -13,6 +13,9 @@
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
+class QDragEnterEvent;
+class QDragLeaveEvent;
+class QDropEvent;
 class QLabel;
 class QPushButton;
 class QResizeEvent;
@@ -31,9 +34,14 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dragLeaveEvent(QDragLeaveEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private:
     void openImage();
+    bool loadSourceFromPath(const QString& path);
+    void setDropHighlight(bool on);
     void generateMaps();
     void importToBlender();
     void handleImportFinished();
@@ -43,6 +51,9 @@ private:
     void updatePreviewTab(int index);
     void updateBumpLabel(int value);
     void updateNormalLabel(int value);
+    void updateDelightLabel(int value);
+    void refreshDelightState();
+    void saveDelightSettings();
     void scheduleLivePreview();
     void refreshLivePreview();
     void changeLanguage(int index);
@@ -116,6 +127,8 @@ private:
     QLabel* m_blenderVersionLabel = nullptr;
     QLabel* m_bumpTitleLabel = nullptr;
     QLabel* m_normalTitleLabel = nullptr;
+    QLabel* m_delightTitleLabel = nullptr;
+    QLabel* m_delightSectionLabel = nullptr;
     QLabel* m_statusLabel = nullptr;
     QLabel* m_inputPreviewLabel = nullptr;
     ZoomPanImageWidget* m_resultPreviewLabel = nullptr;
@@ -133,6 +146,7 @@ private:
     QLabel* m_importNameLabel = nullptr;
     QLabel* m_importLabel = nullptr;
     QLabel* m_bumpValueLabel = nullptr;
+    QLabel* m_delightValueLabel = nullptr;
     QLabel* m_normalValueLabel = nullptr;
     QLabel* m_upscaleStatusLabel = nullptr;
     QToolButton* m_upscaleToggleButton = nullptr;
@@ -159,9 +173,12 @@ private:
 
     QSlider* m_bumpSlider = nullptr;
     QSlider* m_normalSlider = nullptr;
+    QSlider* m_delightSlider = nullptr;
 
     QCheckBox* m_squareCheck = nullptr;
     QCheckBox* m_seamlessCheck = nullptr;
+    QCheckBox* m_delightCheck = nullptr;
+    QCheckBox* m_aiPreviewCheck = nullptr;
     QCheckBox* m_baseCheck = nullptr;
     QCheckBox* m_bumpCheck = nullptr;
     QCheckBox* m_normalCheck = nullptr;
