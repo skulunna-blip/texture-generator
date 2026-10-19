@@ -7,10 +7,16 @@ app/build/
 __pycache__/
 *.pyc
 
-# portable staging dir (recreated by _pack_portable.ps1; only the zip is committed)
+# portable staging dir (recreated by _pack_portable.ps1)
 dist/TextureGeneratorQt/
 dist/TextureGeneratorQt-portable/
 dist/_download/
+
+# The portable zip is a build artifact and ships as a GitHub release asset, not
+# in git. It is 70 MB and regenerated every release, so committing it added a
+# fresh copy to history each time (GitHub warns above 50 MB per file). Anyone
+# who wants it: the "Releases" page, or run _pack_portable.ps1 yourself.
+dist/TextureGeneratorQt-portable.zip
 
 # AI depth model + ONNX Runtime binary. ~61 MB together, so they are fetched
 # with _get_depth_model.ps1 instead of living in git. The small ORT headers in

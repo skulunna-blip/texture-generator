@@ -6,7 +6,7 @@ project over a localhost socket.
 
 > 简体中文：这是一套贴图生成工具。桌面软件（`app/`）用 C++/Qt 写，从一张图片生成
 > PBR 贴图（基础色/法线/凹凸/粗糙度/金属度/AO）；配套的 Blender 扩展（`extension/`）
-> 接收贴图并自动搭材质，免安装绿色版见 `dist/`。
+> 接收贴图并自动搭材质，免安装绿色版见 Releases 页。
 
 ---
 
@@ -29,8 +29,9 @@ texture-generator/
 │   ├── icon.png / featured.png
 │   └── UPLOAD_COPY.md         #   platform upload copy (EN/中文)
 ├── dist/                      # ready-to-use packages
-│   ├── TextureGeneratorQt-portable.zip   # 免安装绿色版 (unzip & run, Windows)
-│   └── tg_blender_link.zip               # Blender 4.2+ extension zip
+│   ├── tg_blender_link.zip               # Blender 4.2+ extension zip
+│   └── TextureGeneratorQt-portable.zip   # 免安装绿色版 — built by _pack_portable.ps1,
+│                                         #   not in git; grab it from Releases
 └── LICENSE                    # GPL-3.0-or-later
 ```
 
@@ -85,10 +86,16 @@ appears in the 3D Viewport showing the listening state. Report bugs on the
 
 ## Portable app (免安装)
 
-`dist/TextureGeneratorQt-portable.zip` runs on any 64-bit Windows PC with no
-install — unzip and double-click `TextureGeneratorQt.exe`. Blender must be
-installed for the Blender-link feature; Real-ESRGAN (for upscaling) is optional,
-see `tools/README.txt` inside the zip.
+Download `TextureGeneratorQt-portable.zip` from the
+[Releases](https://github.com/skulunna-blip/texture-generator/releases) page. It
+runs on any 64-bit Windows PC with no install — unzip and double-click
+`TextureGeneratorQt.exe`. Blender must be installed for the Blender-link
+feature; Real-ESRGAN (for upscaling) is optional, see `tools/README.txt` inside
+the zip.
+
+To build the package yourself, run `_pack_portable.ps1` after building; it
+writes the zip into `dist/`. The zip is not tracked in git — it is a build
+artifact that changes every release.
 
 ## Third-party components
 
