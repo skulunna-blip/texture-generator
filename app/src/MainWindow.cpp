@@ -122,19 +122,46 @@ QString blenderDisplayName(const QString& path)
     return folder.isEmpty() ? QDir::toNativeSeparators(path) : folder;
 }
 
-// True when the install folder encodes a Blender version >= 4.2, e.g.
-// "blender-5.0.1-windows-x64" or "Blender 4.5". Older installs are hidden
-// from the version dropdown.
-bool blenderAtLeast42(const QString& path)
+struct BlenderVersion
+{
+    int major = -1;
+    int minor = -1;
+};
+
+// The Blender version encoded in a path: the folder name first ("Blender 4.5",
+// "blender-5.0.1-windows-x64"), then the whole path for layouts that put the
+// version further up. major stays -1 when nothing can be read.
+BlenderVersion blenderVersionFromPath(const QString& path)
 {
     const QRegularExpression versionPattern(QStringLiteral(R"((\d+)\.(\d+))"));
-    const QRegularExpressionMatch match = versionPattern.match(QFileInfo(path).absoluteDir().dirName());
+
+    QRegularExpressionMatch match = versionPattern.match(QFileInfo(path).absoluteDir().dirName());
     if (!match.hasMatch()) {
-        return false;
+        // Last match wins: it is the one nearest the executable, so
+        // "D:/bl4.5/blender-4.2.17-windows-x64/" reports 4.2 rather than 4.5.
+        QRegularExpressionMatchIterator matches =
+            versionPattern.globalMatch(QDir::fromNativeSeparators(path));
+        while (matches.hasNext()) {
+            match = matches.next();
+        }
     }
-    const int major = match.captured(1).toInt();
-    const int minor = match.captured(2).toInt();
-    return major > 4 || (major == 4 && minor >= 2);
+    if (!match.hasMatch()) {
+        return {};
+    }
+    return {match.captured(1).toInt(), match.captured(2).toInt()};
+}
+
+// True when the path encodes Blender >= 4.2, the minimum the TG Blender Link
+// extension supports. A path whose version cannot be read is accepted: it can
+// only get there by the user picking it, and hiding that choice would make the
+// Browse button look broken.
+bool blenderAtLeast42(const QString& path)
+{
+    const BlenderVersion version = blenderVersionFromPath(path);
+    if (version.major < 0) {
+        return true;
+    }
+    return version.major > 4 || (version.major == 4 && version.minor >= 2);
 }
 
 QSize safePreviewSize(const QLabel* label, const QSize& fallback)
@@ -224,6 +251,14 @@ MainWindow::MainWindow(QWidget* parent)
     // Persist a user-chosen output folder across runs; empty means the default.
     QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
     m_customOutputDir = settings.value(QStringLiteral("output/directory")).toString();
+
+    // A Blender the user picked by hand wins over auto-detection. setBlenderPath
+    // ignores a path that no longer exists, so an uninstalled Blender falls back
+    // to detection instead of leaving the app pointing at nothing.
+    const QString savedBlender = settings.value(QStringLiteral("blender/path")).toString();
+    if (!savedBlender.isEmpty()) {
+        m_blenderBridge.setBlenderPath(savedBlender);
+    }
 
     auto* central = new QWidget;
     auto* rootLayout = new QHBoxLayout(central);
@@ -880,29 +915,7 @@ QWidget* MainWindow::buildSidebar()
     });
     settingsLayout->addWidget(m_bumpSlider);
 
-    auto* normalRow = new QHBoxLayout;
-    m_normalTitleLabel = makeRoleLabel(QStringLiteral("muted"));
-    m_normalValueLabel = new QLabel;
-    m_normalValueLabel->setObjectName(QStringLiteral("valueLabel"));
-    normalRow->addWidget(m_normalTitleLabel);
-    normalRow->addStretch(1);
-    normalRow->addWidget(m_normalValueLabel);
-    settingsLayout->addLayout(normalRow);
-
-    m_normalSlider = new QSlider(Qt::Horizontal);
-    m_normalSlider->installEventFilter(new WheelIgnoreFilter(m_normalSlider));
-    m_normalSlider->setRange(20, 300);
-    m_normalSlider->setValue(100);
-    connect(m_normalSlider, &QSlider::valueChanged, this, &MainWindow::updateNormalLabel);
-    connect(m_normalSlider, &QSlider::sliderPressed, this, [this]() { m_draggingPreview = true; });
-    connect(m_normalSlider, &QSlider::sliderReleased, this, [this]() {
-        m_draggingPreview = false;
-        scheduleLivePreview();
-    });
-    settingsLayout->addWidget(m_normalSlider);
-
     updateBumpLabel(m_bumpSlider->value());
-    updateNormalLabel(m_normalSlider->value());
     updateDelightLabel(m_delightSlider->value());
 
     // Restore the de-lighting preferences; they are written back on every
@@ -991,10 +1004,23 @@ QWidget* MainWindow::buildSidebar()
                 const QString path = m_blenderVersionCombo->currentData().toString();
                 if (!path.isEmpty()) {
                     m_blenderBridge.setBlenderPath(path);
+                    QSettings settings(QStringLiteral("TextureGeneratorQt"),
+                                       QStringLiteral("TextureGeneratorQt"));
+                    settings.setValue(QStringLiteral("blender/path"), QDir::cleanPath(path));
                 }
                 refreshBlenderStatus();
             });
-    blenderLayout->addWidget(m_blenderVersionCombo);
+
+    // Detection cannot cover every layout (a portable Blender anywhere on disk
+    // looks like any other folder), so the user can always point at the exe.
+    auto* blenderPathRow = new QHBoxLayout;
+    blenderPathRow->setContentsMargins(0, 0, 0, 0);
+    blenderPathRow->setSpacing(6);
+    blenderPathRow->addWidget(m_blenderVersionCombo, 1);
+    m_blenderBrowseButton = new QPushButton;
+    connect(m_blenderBrowseButton, &QPushButton::clicked, this, &MainWindow::chooseBlenderExecutable);
+    blenderPathRow->addWidget(m_blenderBrowseButton, 0);
+    blenderLayout->addLayout(blenderPathRow);
     m_statusLabel = makeRoleLabel(QStringLiteral("muted"));
     m_statusLabel->setWordWrap(true);
     m_statusLabel->setObjectName(QStringLiteral("statusCard"));
@@ -1390,8 +1416,6 @@ void MainWindow::importToBlender()
     }
 
     const TextureResult resultCopy = m_result;
-    const double bumpStrength = static_cast<double>(m_bumpSlider->value()) / 100.0;
-    const double normalStrength = static_cast<double>(m_normalSlider->value()) / 100.0;
     const QString preferredBlenderPath = m_blenderBridge.blenderPath();
 
     m_importInFlight = true;
@@ -1404,12 +1428,12 @@ void MainWindow::importToBlender()
     m_importProgressTimer->start();
     refreshBlenderStatus();
 
-    m_importWatcher->setFuture(QtConcurrent::run([resultCopy, bumpStrength, normalStrength, preferredBlenderPath]() {
+    m_importWatcher->setFuture(QtConcurrent::run([resultCopy, preferredBlenderPath]() {
         BlenderBridge bridge;
         if (!preferredBlenderPath.isEmpty()) {
             bridge.setBlenderPath(preferredBlenderPath);
         }
-        return bridge.importMaterial(resultCopy, bumpStrength, normalStrength);
+        return bridge.importMaterial(resultCopy);
     }));
 }
 
@@ -1658,14 +1682,6 @@ void MainWindow::updateDelightLabel(int value)
     scheduleLivePreview();
 }
 
-void MainWindow::updateNormalLabel(int value)
-{
-    if (m_normalValueLabel) {
-        m_normalValueLabel->setText(strengthText(value));
-    }
-    scheduleLivePreview();
-}
-
 void MainWindow::scheduleLivePreview()
 {
     if (m_sourceImage.isNull()) {
@@ -1847,10 +1863,16 @@ void MainWindow::refreshUiText()
         m_seamlessCheck->setText(uiText(QStringLiteral("生成无缝"), QStringLiteral("Make Seamless")));
     }
     if (m_bumpTitleLabel) {
-        m_bumpTitleLabel->setText(uiText(QStringLiteral("凹凸强度"), QStringLiteral("Bump Strength")));
+        m_bumpTitleLabel->setText(uiText(QStringLiteral("起伏强度"), QStringLiteral("Relief Strength")));
     }
-    if (m_normalTitleLabel) {
-        m_normalTitleLabel->setText(uiText(QStringLiteral("法线强度"), QStringLiteral("Normal Strength")));
+    if (m_bumpSlider) {
+        // The slider feeds four maps, which is not obvious from its label alone.
+        m_bumpSlider->setToolTip(
+            uiText(QStringLiteral("表面起伏的幅度。凹凸、法线、AO、粗糙度都由同一张高度场生成，"
+                                  "所以这一个滑块会同时改变这四张图。"),
+                   QStringLiteral("Amplitude of the surface relief. Bump, normal, AO and "
+                                  "roughness all come from the same height field, so this one "
+                                  "slider changes all four maps.")));
     }
     if (m_delightSectionLabel) {
         m_delightSectionLabel->setText(uiText(QStringLiteral("去光影"), QStringLiteral("De-lighting")));
@@ -1877,6 +1899,13 @@ void MainWindow::refreshUiText()
     if (m_blenderVersionLabel) {
         m_blenderVersionLabel->setText(uiText(QStringLiteral("当前版本"), QStringLiteral("Current Version")));
     }
+    if (m_blenderBrowseButton) {
+        m_blenderBrowseButton->setText(uiText(QStringLiteral("浏览…"), QStringLiteral("Browse…")));
+        m_blenderBrowseButton->setToolTip(
+            uiText(QStringLiteral("手动选择 blender.exe。装在非标准位置时用这个。"),
+                   QStringLiteral("Pick blender.exe by hand. Use this when Blender is installed "
+                                  "somewhere the automatic search does not cover.")));
+    }
     if (m_blenderVersionCombo) {
         const QString currentPath = m_blenderBridge.blenderPath();
         QStringList paths;
@@ -1884,6 +1913,12 @@ void MainWindow::refreshUiText()
             if (blenderAtLeast42(candidate)) {
                 paths.append(candidate);
             }
+        }
+        // A Blender the user picked by hand may live anywhere detection does not
+        // search, so it has to be added explicitly or the combo would show a
+        // different install than the one imports actually use.
+        if (!currentPath.isEmpty() && !paths.contains(currentPath, Qt::CaseInsensitive)) {
+            paths.prepend(currentPath);
         }
         const QSignalBlocker blocker(m_blenderVersionCombo);
         m_blenderVersionCombo->clear();
@@ -2262,8 +2297,14 @@ TextureOptions MainWindow::gatherOptions() const
         : 2048;
     options.square = m_squareCheck && m_squareCheck->isChecked();
     options.seamless = m_seamlessCheck && m_seamlessCheck->isChecked();
+    // One slider drives the whole relief. It scales the height field, and the
+    // bump, normal, AO and roughness maps are all derived from that same field,
+    // so they always describe one surface. The normal gain stays neutral: it
+    // used to be a second, independent slider, which made the normal map show a
+    // different surface from the AO and roughness maps whenever the two values
+    // differed.
     options.bumpStrength = m_bumpSlider ? static_cast<double>(m_bumpSlider->value()) / 100.0 : 1.0;
-    options.normalStrength = m_normalSlider ? static_cast<double>(m_normalSlider->value()) / 100.0 : 1.0;
+    options.normalStrength = 1.0;
     options.generateBaseColor = m_baseCheck && m_baseCheck->isChecked();
     options.generateBump = m_bumpCheck && m_bumpCheck->isChecked();
     options.generateNormal = m_normalCheck && m_normalCheck->isChecked();
@@ -2317,6 +2358,35 @@ void MainWindow::chooseOutputDirectory()
     }
     setMessage(uiText(QStringLiteral("输出目录已设为 %1（下次生成生效）。").arg(QDir::toNativeSeparators(m_customOutputDir)),
                       QStringLiteral("Output folder set to %1 (takes effect on the next generation).").arg(QDir::toNativeSeparators(m_customOutputDir))));
+}
+
+void MainWindow::chooseBlenderExecutable()
+{
+    const QString start = m_blenderBridge.blenderExists()
+        ? QFileInfo(m_blenderBridge.blenderPath()).absolutePath()
+        : QStringLiteral("C:/Program Files/Blender Foundation");
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        uiText(QStringLiteral("选择 Blender 可执行文件"), QStringLiteral("Choose blender.exe")),
+        start,
+        uiText(QStringLiteral("Blender (blender.exe);;可执行文件 (*.exe)"),
+               QStringLiteral("Blender (blender.exe);;Executables (*.exe)")));
+    if (path.isEmpty()) {
+        return;
+    }
+
+    // Accept any executable the user points at: a Blender install can be
+    // renamed or unpacked anywhere, and refusing a name we did not expect would
+    // leave them with no way in at all.
+    m_blenderBridge.setBlenderPath(path);
+    QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+    settings.setValue(QStringLiteral("blender/path"), QDir::cleanPath(path));
+
+    // The dropdown is rebuilt from the bridge, which now lists this path too.
+    refreshUiText();
+    refreshBlenderStatus();
+    setMessage(uiText(QStringLiteral("Blender 路径已设为 %1。").arg(QDir::toNativeSeparators(path)),
+                      QStringLiteral("Blender path set to %1.").arg(QDir::toNativeSeparators(path))));
 }
 
 void MainWindow::setResolutionButtonState(int resolution)

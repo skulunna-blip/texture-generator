@@ -23,12 +23,12 @@ public:
         QString mode;
     };
 
-    ImportResult importMaterial(const TextureResult& result, double bumpStrength, double normalStrength) const;
+    ImportResult importMaterial(const TextureResult& result) const;
 
 private:
     QStringList detectBlenderInstallations() const;
     QString pickDefaultBlenderPath(const QStringList& candidates) const;
-    QString buildMaterialScript(const TextureResult& result, double bumpStrength, double normalStrength, bool liveSession) const;
+    QString buildMaterialScript(const TextureResult& result, bool liveSession) const;
     ImportResult importViaMcp(const QString& script) const;
     ImportResult launchBlender(const QString& script, const QString& outputDirectory) const;
 

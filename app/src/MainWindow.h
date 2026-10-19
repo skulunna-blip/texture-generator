@@ -50,7 +50,6 @@ private:
     void refreshUpscaleState();
     void updatePreviewTab(int index);
     void updateBumpLabel(int value);
-    void updateNormalLabel(int value);
     void updateDelightLabel(int value);
     void refreshDelightState();
     void saveDelightSettings();
@@ -58,6 +57,7 @@ private:
     void refreshLivePreview();
     void changeLanguage(int index);
     void chooseOutputDirectory();
+    void chooseBlenderExecutable();
 
 private:
     enum class UiLanguage
@@ -126,7 +126,6 @@ private:
     QLabel* m_blenderSectionLabel = nullptr;
     QLabel* m_blenderVersionLabel = nullptr;
     QLabel* m_bumpTitleLabel = nullptr;
-    QLabel* m_normalTitleLabel = nullptr;
     QLabel* m_delightTitleLabel = nullptr;
     QLabel* m_delightSectionLabel = nullptr;
     QLabel* m_statusLabel = nullptr;
@@ -147,9 +146,9 @@ private:
     QLabel* m_importLabel = nullptr;
     QLabel* m_bumpValueLabel = nullptr;
     QLabel* m_delightValueLabel = nullptr;
-    QLabel* m_normalValueLabel = nullptr;
     QLabel* m_upscaleStatusLabel = nullptr;
     QToolButton* m_upscaleToggleButton = nullptr;
+    QPushButton* m_blenderBrowseButton = nullptr;
 
     TiledPreviewWidget* m_tiledPreview = nullptr;
     MaterialPreviewWidget* m_materialPreview = nullptr;
@@ -172,7 +171,6 @@ private:
     QTabBar* m_tabBar = nullptr;
 
     QSlider* m_bumpSlider = nullptr;
-    QSlider* m_normalSlider = nullptr;
     QSlider* m_delightSlider = nullptr;
 
     QCheckBox* m_squareCheck = nullptr;

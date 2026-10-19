@@ -9,6 +9,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QSettings>
+#include <QStandardPaths>
 #include <QTcpSocket>
 #include <QThread>
 
@@ -94,10 +96,10 @@ void BlenderBridge::setBlenderPath(const QString& path)
     m_blenderPath = normalized;
 }
 
-BlenderBridge::ImportResult BlenderBridge::importMaterial(const TextureResult& result, double bumpStrength, double normalStrength) const
+BlenderBridge::ImportResult BlenderBridge::importMaterial(const TextureResult& result) const
 {
     const bool liveSession = isMcpOnline();
-    const QString script = buildMaterialScript(result, bumpStrength, normalStrength, liveSession);
+    const QString script = buildMaterialScript(result, liveSession);
 
     if (liveSession) {
         ImportResult liveResult = importViaMcp(script);
@@ -133,7 +135,72 @@ BlenderBridge::ImportResult BlenderBridge::importMaterial(const TextureResult& r
 
 QStringList BlenderBridge::detectBlenderInstallations() const
 {
-    const QStringList candidates = {
+    QStringList found;
+
+    auto add = [&found](const QString& candidate) {
+        if (candidate.isEmpty()) {
+            return;
+        }
+        const QString normalized = normalizedPath(candidate);
+        if (QFile::exists(normalized) && !found.contains(normalized, Qt::CaseInsensitive)) {
+            found.append(normalized);
+        }
+    };
+
+    // 1. The installer records where it put Blender. Tried first because it is
+    //    the only source that works regardless of drive or folder layout. Both
+    //    registry views are read (a 32-bit host exposes its keys under
+    //    WOW6432Node) and HKCU is included for per-user installs.
+    const QStringList registryRoots = {
+        QStringLiteral("HKEY_LOCAL_MACHINE"),
+        QStringLiteral("HKEY_CURRENT_USER")
+    };
+    const QStringList registryKeys = {
+        QStringLiteral("SOFTWARE\\BlenderFoundation\\Blender"),
+        QStringLiteral("SOFTWARE\\WOW6432Node\\BlenderFoundation\\Blender")
+    };
+    for (const QString& root : registryRoots) {
+        for (const QString& key : registryKeys) {
+            QSettings blenderKey(root + QLatin1Char('\\') + key, QSettings::NativeFormat);
+            const QStringList versions = blenderKey.childGroups();
+            for (const QString& version : versions) {
+                const QString installDir = blenderKey.value(version + QStringLiteral("/InstallDir")).toString();
+                if (!installDir.isEmpty()) {
+                    add(installDir + QStringLiteral("/blender.exe"));
+                }
+            }
+        }
+    }
+
+    // 2. Every "Blender <version>" folder under the standard program
+    //    directories. This used to name four versions explicitly, so a 4.3 or a
+    //    3.6 install in the default location was invisible; any version found
+    //    is offered now and the UI decides which ones it can link to.
+    QStringList programRoots;
+    for (const char* name : {"ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"}) {
+        const QString value = qEnvironmentVariable(name);
+        if (!value.isEmpty() && !programRoots.contains(value, Qt::CaseInsensitive)) {
+            programRoots.append(value);
+        }
+    }
+    for (const QString& root : programRoots) {
+        const QDir foundation(root + QStringLiteral("/Blender Foundation"));
+        const QStringList versions = foundation.entryList({QStringLiteral("Blender *")},
+                                                          QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString& version : versions) {
+            add(foundation.absoluteFilePath(version + QStringLiteral("/blender.exe")));
+        }
+        // Steam keeps its own copy outside Blender Foundation.
+        add(root + QStringLiteral("/Steam/steamapps/common/Blender/blender.exe"));
+    }
+
+    // 3. Whatever is reachable through PATH.
+    add(QStandardPaths::findExecutable(QStringLiteral("blender")));
+
+    // 4. The folder layout the builds on this machine use. On any other machine
+    //    these paths simply do not exist, which is why they are last rather
+    //    than the only source.
+    const QStringList known = {
         QStringLiteral("D:/blender5.1/blender-5.0.1-windows-x64/blender.exe"),
         QStringLiteral("D:/bl511/blender-5.1.0-windows-x64/blender.exe"),
         QStringLiteral("D:/blender4.5/blender-4.5.5-windows-x64/blender.exe"),
@@ -143,20 +210,12 @@ QStringList BlenderBridge::detectBlenderInstallations() const
         QStringLiteral("D:/bl3600/blender-3.6.0-windows-x64/blender.exe"),
         QStringLiteral("D:/bl36/blender-3.6.2-windows-x64/blender-3.6.2-windows-x64/blender.exe"),
         QStringLiteral("D:/bl350/blender-3.5.0-windows-x64/blender.exe"),
-        QStringLiteral("D:/blender332/blender-3.3.2-windows-x64/blender-3.3.2-windows-x64/blender.exe"),
-        QStringLiteral("C:/Program Files/Blender Foundation/Blender 5.1/blender.exe"),
-        QStringLiteral("C:/Program Files/Blender Foundation/Blender 5.0/blender.exe"),
-        QStringLiteral("C:/Program Files/Blender Foundation/Blender 4.5/blender.exe"),
-        QStringLiteral("C:/Program Files/Blender Foundation/Blender 4.2/blender.exe")
+        QStringLiteral("D:/blender332/blender-3.3.2-windows-x64/blender-3.3.2-windows-x64/blender.exe")
     };
-
-    QStringList found;
-    for (const QString& candidate : candidates) {
-        const QString normalized = normalizedPath(candidate);
-        if (QFile::exists(normalized) && !found.contains(normalized, Qt::CaseInsensitive)) {
-            found.append(normalized);
-        }
+    for (const QString& candidate : known) {
+        add(candidate);
     }
+
     return found;
 }
 
@@ -170,7 +229,7 @@ QString BlenderBridge::pickDefaultBlenderPath(const QStringList& candidates) con
     return candidates.isEmpty() ? QString() : candidates.first();
 }
 
-QString BlenderBridge::buildMaterialScript(const TextureResult& result, double bumpStrength, double normalStrength, bool liveSession) const
+QString BlenderBridge::buildMaterialScript(const TextureResult& result, bool liveSession) const
 {
     const QString materialName = QStringLiteral("TG_%1").arg(result.jobId);
     const QString base = pythonEscaped(result.filePaths.value(QStringLiteral("base")));
@@ -190,17 +249,15 @@ from pathlib import Path
 
 live_session = %1
 material_name = "%2"
-bump_strength = %3
-normal_strength = %4
-base_path = Path("%5")
-bump_path = Path("%6")
-normal_path = Path("%7")
-roughness_path = Path("%8")
-metal_path = Path("%9")
-ao_path = Path("%10")
-alpha_path = Path("%11")
-output_dir = Path("%12")
-use_alpha = %13
+base_path = Path("%3")
+bump_path = Path("%4")
+normal_path = Path("%5")
+roughness_path = Path("%6")
+metal_path = Path("%7")
+ao_path = Path("%8")
+alpha_path = Path("%9")
+output_dir = Path("%10")
+use_alpha = %11
 
 log_path = output_dir / "blender_import_log.txt"
 blend_path = output_dir / "blender_preview.blend"
@@ -406,7 +463,11 @@ try:
             tag(tex, normal_frame, "Normal")
             normal_map = nodes.new("ShaderNodeNormalMap")
             normal_map.location = (-180, 40)
-            normal_map.inputs["Strength"].default_value = normal_strength
+            # The relief strength was already baked into the normal map when it
+            # was generated, so consume it as-is. Scaling it again here would
+            # apply the slider twice (effective strength = slider squared) and
+            # would no longer match the app's own 3D preview.
+            normal_map.inputs["Strength"].default_value = 1.0
             tag(normal_map, normal_frame, "Normal Map")
             links.new(tex.outputs["Color"], normal_map.inputs["Color"])
             normal_socket = normal_map.outputs["Normal"]
@@ -419,7 +480,8 @@ try:
             tag(tex, bump_frame, "Bump")
             bump = nodes.new("ShaderNodeBump")
             bump.location = (-180, -180)
-            bump.inputs["Strength"].default_value = bump_strength
+            # Same reason as the normal map: the relief strength is in bump.png.
+            bump.inputs["Strength"].default_value = 1.0
             tag(bump, bump_frame, "Bump")
             links.new(tex.outputs["Color"], bump.inputs["Height"])
             if normal_socket is not None:
@@ -491,8 +553,6 @@ except Exception as exc:
 )PY")
         .arg(liveSession ? QStringLiteral("True") : QStringLiteral("False"))
         .arg(pythonEscaped(materialName))
-        .arg(QString::number(bumpStrength, 'f', 3))
-        .arg(QString::number(normalStrength, 'f', 3))
         .arg(base)
         .arg(bump)
         .arg(normal)
