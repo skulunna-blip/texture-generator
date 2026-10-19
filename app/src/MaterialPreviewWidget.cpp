@@ -21,6 +21,15 @@ namespace
 {
 constexpr float kPi = 3.1415926535f;
 
+// The cube's face diagonal (|(±h, ±h, ±h)| with h = 0.9) is 1.56, against the
+// sphere's radius of 1.0, so at the sphere's camera distance the cube's corners
+// run into the near plane and the shape stops reading as a cube. Pulling the
+// camera back for the cube keeps its whole silhouette inside the frame.
+float defaultDistance(MaterialPreviewWidget::PreviewShape shape)
+{
+    return shape == MaterialPreviewWidget::PreviewShape::Cube ? 4.6f : 2.8f;
+}
+
 // Keep a rotation angle inside [lower, upper) so a material ball can be spun
 // through a full 360 degrees without the angle growing without bound.
 float wrapDegrees(float angle, float lower, float upper)
@@ -143,6 +152,78 @@ void appendSphere(QVector<PreviewVertex>& vertices, QVector<quint32>& indices)
             indices.push_back(row1 + 1);
         }
     }
+}
+
+// One face of a cube, as a quad. Each face gets the same u/v range (0..1) so
+// the whole generated map lands on every side, the way a tiling texture is
+// normally judged. The tangent is the face's world-space +u axis, which the
+// shader combines with the (flat, per-face) normal to build a valid TBN frame,
+// so normal maps still resolve correctly on a flat surface.
+void appendQuad(QVector<PreviewVertex>& vertices,
+                QVector<quint32>& indices,
+                const QVector3D& origin,
+                const QVector3D& uAxis,
+                const QVector3D& vAxis,
+                const QVector3D& normal)
+{
+    const quint32 base = static_cast<quint32>(vertices.size());
+    const QVector3D tangent = uAxis.normalized();
+
+    const QVector3D corners[4] = {
+        origin,
+        origin + uAxis,
+        origin + uAxis + vAxis,
+        origin + vAxis,
+    };
+    const QVector2D uvs[4] = {
+        QVector2D(0.0f, 0.0f),
+        QVector2D(1.0f, 0.0f),
+        QVector2D(1.0f, 1.0f),
+        QVector2D(0.0f, 1.0f),
+    };
+    for (int corner = 0; corner < 4; ++corner) {
+        vertices.push_back({
+            corners[corner].x(),
+            corners[corner].y(),
+            corners[corner].z(),
+            normal.x(),
+            normal.y(),
+            normal.z(),
+            uvs[corner].x(),
+            uvs[corner].y(),
+            tangent.x(),
+            tangent.y(),
+            tangent.z(),
+        });
+    }
+
+    // Counter-clockwise when seen from outside, so back-face culling keeps the
+    // faces we want and hides the inside of the cube.
+    indices.push_back(base + 0);
+    indices.push_back(base + 1);
+    indices.push_back(base + 2);
+    indices.push_back(base + 0);
+    indices.push_back(base + 2);
+    indices.push_back(base + 3);
+}
+
+void appendCube(QVector<PreviewVertex>& vertices, QVector<quint32>& indices)
+{
+    // A half-size of 0.9 puts the cube's silhouette close to the sphere's
+    // radius, so switching shapes does not make the material jump in size.
+    constexpr float h = 0.9f;
+
+    // +X, -X. The origin has to sit on the same side as the normal: a quad at
+    // x = -h carrying a +X normal is an inward-facing face, which back-face
+    // culling removes, leaving a hole where the outside of the cube should be.
+    appendQuad(vertices, indices, {h, -h, h}, {0, 0, -2.0f * h}, {0, 2.0f * h, 0}, {1, 0, 0});
+    appendQuad(vertices, indices, {-h, -h, -h}, {0, 0, 2.0f * h}, {0, 2.0f * h, 0}, {-1, 0, 0});
+    // +Y, -Y
+    appendQuad(vertices, indices, {-h, h, h}, {2.0f * h, 0, 0}, {0, 0, -2.0f * h}, {0, 1, 0});
+    appendQuad(vertices, indices, {-h, -h, -h}, {2.0f * h, 0, 0}, {0, 0, 2.0f * h}, {0, -1, 0});
+    // +Z, -Z
+    appendQuad(vertices, indices, {-h, -h, h}, {2.0f * h, 0, 0}, {0, 2.0f * h, 0}, {0, 0, 1});
+    appendQuad(vertices, indices, {h, -h, -h}, {-2.0f * h, 0, 0}, {0, 2.0f * h, 0}, {0, 0, -1});
 }
 
 const char* kVertexShader = R"GLSL(
@@ -430,6 +511,45 @@ MaterialPreviewWidget::PreviewMode MaterialPreviewWidget::previewMode() const
     return m_previewMode;
 }
 
+void MaterialPreviewWidget::resetView()
+{
+    // A three-quarter view: the turntable spins around Y, but the cube also
+    // needs a little vertical tilt and a yaw offset so two faces are visible
+    // at once instead of looking at a single flat face head-on.
+    m_pitch = 22.0f;
+    m_manualYaw = 35.0f;
+    m_distance = defaultDistance(m_shape);
+    update();
+}
+
+void MaterialPreviewWidget::setPreviewShape(PreviewShape shape)
+{
+    if (m_shape == shape) {
+        return;
+    }
+
+    m_shape = shape;
+    m_distance = defaultDistance(shape);
+    // The buffers hold the old shape's vertices, so they have to be rebuilt.
+    // Doing it here (rather than lazily) means ensureGeometry() in paintGL sees
+    // a clean slate and cannot draw last frame's geometry.
+    if (context()) {
+        makeCurrent();
+        m_vao.destroy();
+        m_vertexBuffer.destroy();
+        m_indexBuffer.destroy();
+        m_indexCount = 0;
+        ensureGeometry();
+        doneCurrent();
+    }
+    update();
+}
+
+MaterialPreviewWidget::PreviewShape MaterialPreviewWidget::previewShape() const
+{
+    return m_shape;
+}
+
 void MaterialPreviewWidget::initializeGL()
 {
     logGl(QStringLiteral("initializeGL called"));
@@ -701,13 +821,18 @@ void MaterialPreviewWidget::ensureProgram()
 
 void MaterialPreviewWidget::ensureGeometry()
 {
-    if (m_vertexBuffer.isCreated() && m_indexBuffer.isCreated() && m_indexCount > 0) {
+    if (m_vertexBuffer.isCreated() && m_indexBuffer.isCreated() && m_indexCount > 0
+        && m_builtShape == m_shape) {
         return;
     }
 
     QVector<PreviewVertex> vertices;
     QVector<quint32> indices;
-    appendSphere(vertices, indices);
+    if (m_shape == PreviewShape::Cube) {
+        appendCube(vertices, indices);
+    } else {
+        appendSphere(vertices, indices);
+    }
 
     if (!m_vao.isCreated()) {
         m_vao.create();
@@ -731,6 +856,7 @@ void MaterialPreviewWidget::ensureGeometry()
     m_vao.release();
 
     m_indexCount = indices.size();
+    m_builtShape = m_shape;
 }
 
 void MaterialPreviewWidget::rebuildTextures()

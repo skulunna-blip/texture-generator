@@ -371,6 +371,13 @@ MainWindow::MainWindow(QWidget* parent)
             background: #12171d;
             border-right: 1px solid #232b36;
         }
+        /* Fixed bar under the scroll area: a top border separates it from the
+           settings that scroll, so the primary action reads as always-present
+           rather than as the last item in the list. */
+        #actionBar {
+            background: #151b22;
+            border-top: 1px solid #2b3440;
+        }
         #panel, #headerPanel, #previewPanel, #metaPanel {
             background: #171d24;
             border: 1px solid #2b3440;
@@ -843,6 +850,34 @@ QWidget* MainWindow::buildSidebar()
     settingsLayout->addWidget(m_styleSectionLabel);
     settingsLayout->addWidget(m_styleCombo);
 
+    // Relief strength belongs with the other "what does the surface look like"
+    // settings, not under the de-lighting header. While it sat there the
+    // section header above it read as if it governed this slider too, which is
+    // wrong: de-lighting rewrites the source, this only scales the height
+    // field derived from it.
+    auto* bumpRow = new QHBoxLayout;
+    m_bumpTitleLabel = makeRoleLabel(QStringLiteral("muted"));
+    m_bumpValueLabel = new QLabel;
+    m_bumpValueLabel->setObjectName(QStringLiteral("valueLabel"));
+    bumpRow->addWidget(m_bumpTitleLabel);
+    bumpRow->addStretch(1);
+    bumpRow->addWidget(m_bumpValueLabel);
+    settingsLayout->addLayout(bumpRow);
+
+    m_bumpSlider = new QSlider(Qt::Horizontal);
+    m_bumpSlider->installEventFilter(new WheelIgnoreFilter(m_bumpSlider));
+    m_bumpSlider->setRange(20, 300);
+    m_bumpSlider->setValue(100);
+    connect(m_bumpSlider, &QSlider::valueChanged, this, &MainWindow::updateBumpLabel);
+    // While dragging, recompute at a reduced resolution so the preview keeps up
+    // with the mouse; the full-res pass runs once on release.
+    connect(m_bumpSlider, &QSlider::sliderPressed, this, [this]() { m_draggingPreview = true; });
+    connect(m_bumpSlider, &QSlider::sliderReleased, this, [this]() {
+        m_draggingPreview = false;
+        scheduleLivePreview();
+    });
+    settingsLayout->addWidget(m_bumpSlider);
+
     m_squareCheck = new QCheckBox;
     m_squareCheck->setChecked(true);
     m_seamlessCheck = new QCheckBox;
@@ -851,11 +886,9 @@ QWidget* MainWindow::buildSidebar()
     settingsLayout->addWidget(m_squareCheck);
     settingsLayout->addWidget(m_seamlessCheck);
 
-    // De-lighting comes first and gets its own header, because it is not one
-    // more surface-detail dial: it rewrites the source image that every later
-    // stage reads. The bump and normal sliders below are working on the
-    // de-lit result, so a reader who has them above this cannot tell which
-    // image they are describing.
+    // De-lighting gets its own header because it is not one more
+    // surface-detail dial: it rewrites the source image that every later stage
+    // reads.
     m_delightSectionLabel = makeRoleLabel(QStringLiteral("section"));
     settingsLayout->addWidget(m_delightSectionLabel);
 
@@ -891,29 +924,6 @@ QWidget* MainWindow::buildSidebar()
         scheduleLivePreview();
     });
     settingsLayout->addWidget(m_delightSlider);
-
-    auto* bumpRow = new QHBoxLayout;
-    m_bumpTitleLabel = makeRoleLabel(QStringLiteral("muted"));
-    m_bumpValueLabel = new QLabel;
-    m_bumpValueLabel->setObjectName(QStringLiteral("valueLabel"));
-    bumpRow->addWidget(m_bumpTitleLabel);
-    bumpRow->addStretch(1);
-    bumpRow->addWidget(m_bumpValueLabel);
-    settingsLayout->addLayout(bumpRow);
-
-    m_bumpSlider = new QSlider(Qt::Horizontal);
-    m_bumpSlider->installEventFilter(new WheelIgnoreFilter(m_bumpSlider));
-    m_bumpSlider->setRange(20, 300);
-    m_bumpSlider->setValue(100);
-    connect(m_bumpSlider, &QSlider::valueChanged, this, &MainWindow::updateBumpLabel);
-    // While dragging, recompute at a reduced resolution so the preview keeps up
-    // with the mouse; the full-res pass runs once on release.
-    connect(m_bumpSlider, &QSlider::sliderPressed, this, [this]() { m_draggingPreview = true; });
-    connect(m_bumpSlider, &QSlider::sliderReleased, this, [this]() {
-        m_draggingPreview = false;
-        scheduleLivePreview();
-    });
-    settingsLayout->addWidget(m_bumpSlider);
 
     updateBumpLabel(m_bumpSlider->value());
     updateDelightLabel(m_delightSlider->value());
@@ -1025,10 +1035,6 @@ QWidget* MainWindow::buildSidebar()
     m_statusLabel->setWordWrap(true);
     m_statusLabel->setObjectName(QStringLiteral("statusCard"));
     blenderLayout->addWidget(m_statusLabel);
-    m_generateButton = new QPushButton;
-    m_generateButton->setProperty("variant", QStringLiteral("primary"));
-    connect(m_generateButton, &QPushButton::clicked, this, &MainWindow::generateMaps);
-    blenderLayout->addWidget(m_generateButton);
     m_importButton = new QPushButton;
     m_importButton->setProperty("variant", QStringLiteral("accent"));
     m_importButton->setEnabled(false);
@@ -1038,9 +1044,29 @@ QWidget* MainWindow::buildSidebar()
     layout->addStretch(1);
     scroll->setWidget(content);
 
+    // Generate is the app's primary action, but it used to live at the bottom
+    // of the scrolling stack, below four collapsed-by-default-free sections --
+    // on a 920 px window the user had to scroll to find it. It now lives in a
+    // fixed action bar under the scroll area, so it is always one click away
+    // regardless of how far the user has scrolled or how many sections are
+    // open.
+    auto* actionBar = new QWidget;
+    actionBar->setObjectName(QStringLiteral("actionBar"));
+    auto* actionLayout = new QVBoxLayout(actionBar);
+    actionLayout->setContentsMargins(16, 10, 16, 12);
+    actionLayout->setSpacing(6);
+
+    m_generateButton = new QPushButton;
+    m_generateButton->setProperty("variant", QStringLiteral("primary"));
+    m_generateButton->setMinimumHeight(38);
+    connect(m_generateButton, &QPushButton::clicked, this, &MainWindow::generateMaps);
+    actionLayout->addWidget(m_generateButton);
+
     auto* outer = new QVBoxLayout(sidebar);
     outer->setContentsMargins(0, 0, 0, 0);
-    outer->addWidget(scroll);
+    outer->setSpacing(0);
+    outer->addWidget(scroll, 1);
+    outer->addWidget(actionBar, 0);
     return sidebar;
 }
 
@@ -1081,6 +1107,12 @@ QWidget* MainWindow::buildMapToggles()
     grid->addWidget(m_metalCheck, 2, 0);
     grid->addWidget(m_aoCheck, 2, 1);
     grid->addWidget(m_alphaCheck, 3, 0, 1, 2);
+
+    // The checks drive which maps exist, so the preview tabs have to follow
+    // them immediately rather than waiting for the next generation.
+    for (QCheckBox* check : checks) {
+        connect(check, &QCheckBox::toggled, this, &MainWindow::refreshTabAvailability);
+    }
     return wrapper;
 }
 
@@ -1188,9 +1220,55 @@ QWidget* MainWindow::buildWorkspace()
     materialTitleRow->addWidget(m_materialPreviewTitleLabel);
     materialTitleRow->addStretch(1);
     materialTitleRow->addWidget(m_previewModeCombo);
+
+    // Sphere-vs-cube sits next to the full/normal-only/bump-only switch because
+    // they answer two halves of the same question: what am I looking at, and
+    // what is it wrapped around.
+    m_previewShapeCombo = new QComboBox;
+    m_previewShapeCombo->installEventFilter(new WheelIgnoreFilter(m_previewShapeCombo));
+    m_previewShapeCombo->addItem(QStringLiteral("球体"),
+                                 static_cast<int>(MaterialPreviewWidget::PreviewShape::Sphere));
+    m_previewShapeCombo->addItem(QStringLiteral("立方体"),
+                                 static_cast<int>(MaterialPreviewWidget::PreviewShape::Cube));
+    connect(m_previewShapeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                if (!m_materialPreview || !m_previewShapeCombo) {
+                    return;
+                }
+                const auto shape = static_cast<MaterialPreviewWidget::PreviewShape>(
+                    m_previewShapeCombo->currentData().toInt());
+                m_materialPreview->setPreviewShape(shape);
+                if (shape == MaterialPreviewWidget::PreviewShape::Cube) {
+                    // The shared turntable starts straight-on, which hides a
+                    // cube's relief on a single flat face. The cube gets a
+                    // three-quarter view so two faces read at once.
+                    m_materialPreview->resetView();
+                }
+                QSettings settings(QStringLiteral("TextureGeneratorQt"),
+                                   QStringLiteral("TextureGeneratorQt"));
+                settings.setValue(QStringLiteral("preview/shape"), static_cast<int>(shape));
+            });
+    materialTitleRow->addWidget(m_previewShapeCombo);
     m_materialPreview = new MaterialPreviewWidget;
     m_materialPreview->setMinimumHeight(300);
     m_materialPreview->setStyleSheet(QStringLiteral("background: #141920; border: 1px solid #2c3440; border-radius: 6px;"));
+
+    // Restore the last shape without the combo's signal firing, so nothing is
+    // written back just because the window was built.
+    {
+        QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+        const int savedShape = settings.value(QStringLiteral("preview/shape"),
+                                              static_cast<int>(MaterialPreviewWidget::PreviewShape::Sphere)).toInt();
+        const auto shape = savedShape == static_cast<int>(MaterialPreviewWidget::PreviewShape::Cube)
+            ? MaterialPreviewWidget::PreviewShape::Cube
+            : MaterialPreviewWidget::PreviewShape::Sphere;
+        const QSignalBlocker blocker(m_previewShapeCombo);
+        m_previewShapeCombo->setCurrentIndex(shape == MaterialPreviewWidget::PreviewShape::Cube ? 1 : 0);
+        m_materialPreview->setPreviewShape(shape);
+    }
+
     materialLayout->addLayout(materialTitleRow);
     materialLayout->addWidget(m_materialPreview, 1);
     m_sidePreviewSplitter->addWidget(materialPanel);
@@ -1666,6 +1744,39 @@ void MainWindow::updatePreviewTab(int)
     refreshVisiblePreview();
 }
 
+void MainWindow::refreshTabAvailability()
+{
+    if (!m_tabBar) {
+        return;
+    }
+
+    // One entry per tab, in tab order, matching currentMapKey().
+    const QList<QCheckBox*> toggles = {
+        m_baseCheck,
+        m_bumpCheck,
+        m_normalCheck,
+        m_roughnessCheck,
+        m_metalCheck,
+        m_aoCheck,
+        m_alphaCheck,
+    };
+
+    int fallbackIndex = -1;
+    for (int index = 0; index < m_tabBar->count(); ++index) {
+        const bool enabled = index >= toggles.size() || (toggles[index] && toggles[index]->isChecked());
+        m_tabBar->setTabEnabled(index, enabled);
+        if (enabled && fallbackIndex < 0) {
+            fallbackIndex = index;
+        }
+    }
+
+    // Never leave the user staring at a disabled tab. If the active one was
+    // just switched off, move to the first map that is still being generated.
+    if (!m_tabBar->isTabEnabled(m_tabBar->currentIndex()) && fallbackIndex >= 0) {
+        m_tabBar->setCurrentIndex(fallbackIndex);
+    }
+}
+
 void MainWindow::updateBumpLabel(int value)
 {
     if (m_bumpValueLabel) {
@@ -1972,6 +2083,9 @@ void MainWindow::refreshUiText()
         m_tabBar->setTabText(4, uiText(QStringLiteral("金属度"), QStringLiteral("Metallic")));
         m_tabBar->setTabText(5, uiText(QStringLiteral("AO"), QStringLiteral("AO")));
         m_tabBar->setTabText(6, uiText(QStringLiteral("透明"), QStringLiteral("Alpha")));
+        // A tab whose map is not being generated has nothing behind it; greying
+        // it out stops the click from silently landing on an empty preview.
+        refreshTabAvailability();
     }
     if (m_tiledPreviewTitleLabel) {
         m_tiledPreviewTitleLabel->setText(uiText(QStringLiteral("平铺预览"), QStringLiteral("Tiled Preview")));
@@ -2003,6 +2117,20 @@ void MainWindow::refreshUiText()
             }
             if (bumpIndex >= 0) {
                 m_previewModeCombo->setItemText(bumpIndex, uiText(QStringLiteral("仅凹凸"), QStringLiteral("Bump Only")));
+            }
+        }
+        if (m_previewShapeCombo) {
+            const int sphereIndex = m_previewShapeCombo->findData(
+                static_cast<int>(MaterialPreviewWidget::PreviewShape::Sphere));
+            const int cubeIndex = m_previewShapeCombo->findData(
+                static_cast<int>(MaterialPreviewWidget::PreviewShape::Cube));
+            if (sphereIndex >= 0) {
+                m_previewShapeCombo->setItemText(sphereIndex,
+                                                uiText(QStringLiteral("球体"), QStringLiteral("Sphere")));
+            }
+            if (cubeIndex >= 0) {
+                m_previewShapeCombo->setItemText(cubeIndex,
+                                                 uiText(QStringLiteral("立方体"), QStringLiteral("Cube")));
             }
         }
     }

@@ -285,6 +285,30 @@ target_compile_definitions(tg_rotate_sweep
         QT_NO_CAST_TO_ASCII
 )
 
+# Preview shape: the material ball can be switched to a cube. Verifies the cube
+# is actually drawn (not culled away by reversed winding), is more angular than
+# the sphere, and that switching back rebuilds the sphere's geometry.
+qt_add_executable(tg_shape_check
+    src/MaterialPreviewWidget.h
+    src/MaterialPreviewWidget.cpp
+    shape_test_main.cpp
+)
+
+target_include_directories(tg_shape_check PRIVATE src)
+
+target_link_libraries(tg_shape_check
+    PRIVATE
+        Qt6::Widgets
+        Qt6::OpenGL
+        Qt6::OpenGLWidgets
+)
+
+target_compile_definitions(tg_shape_check
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
 # Lighting removal: synthetic albedo * shading scene with a known answer, so
 # the classical de-lighting pass is measured rather than eyeballed. Also gates
 # the "strength 0 is a byte-exact passthrough" contract and seamless tiling.

@@ -49,6 +49,7 @@ private:
     void handleUpscaleFinished();
     void refreshUpscaleState();
     void updatePreviewTab(int index);
+    void refreshTabAvailability();
     void updateBumpLabel(int value);
     void updateDelightLabel(int value);
     void refreshDelightState();
@@ -153,6 +154,7 @@ private:
     TiledPreviewWidget* m_tiledPreview = nullptr;
     MaterialPreviewWidget* m_materialPreview = nullptr;
     QComboBox* m_previewModeCombo = nullptr;
+    QComboBox* m_previewShapeCombo = nullptr;
 
     QPushButton* m_chooseButton = nullptr;
     QPushButton* m_outputDirButton = nullptr;
