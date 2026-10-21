@@ -82,6 +82,11 @@ struct TextureOptions
     bool seamless = false;
     SeamlessMode seamlessMode = SeamlessMode::Blend;
     double bumpStrength = 1.0;
+    // Bits per sample in bump.png. 8 is what every game engine and Blender's
+    // default image import expects; 16 is lossless enough that the export stops
+    // being the weakest link, at twice the file size. The height field itself is
+    // float either way - this only decides how much of it survives the file.
+    int bumpBits = 8;
     double normalStrength = 1.0;
     TextureBackendMode backendMode = TextureBackendMode::EnhancedDetail;
     StyleMode styleMode = StyleMode::Realistic;
@@ -89,7 +94,9 @@ struct TextureOptions
     // true albedo. Independent of the backend choice - it is a classical pass,
     // but it borrows the depth map as a guide when the neural backend is on.
     bool removeLighting = false;
-    double delightStrength = 0.8;
+    // Off by default and, when switched on, at full strength: turning it on is
+    // the decision, and a 0.8 default made "on" quietly mean "mostly on".
+    double delightStrength = 1.0;
     // Whether the live preview also runs the depth model. Off by default: the
     // final generate is what has to be right, and the classic preview stays
     // instant. The depth map itself is cached, so once the model has run for a

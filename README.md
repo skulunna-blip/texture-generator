@@ -41,6 +41,17 @@ texture-generator/
 - Dark tool UI, 中文/English switchable.
 - 1K / 2K / 4K output, optional square crop, optional seamless tiling
   (offset-blend + wrap-aware derived maps).
+- **Five seamless engines**, because averaging across a seam destroys exactly
+  the structure that makes a tiling texture read as a surface: *Blend* (pyramid
+  blend, instant), *PatchMatch* and *GPNN* (synthesise the seam band from the
+  rest of the image), *Resynthesizer* (GIMP-style, rolls the seam to the middle
+  first) and *Mirror* (instant, symmetric). All of them are wrap-aware, so the
+  normal, AO and roughness maps derived afterwards stay seamless too.
+- **Square-fit modes** for non-square sources: crop, stretch, mirror,
+  resynthesize and seam-carve.
+- **Source upscaling (Real-ESRGAN)**: enlarges the picture you dropped in, then
+  generates from the larger source, so every map benefits instead of one map
+  being invented at high resolution. Shows a live percentage while it runs.
 - Material decomposition engines: Classic Fast, Enhanced Detail (multi-scale DoG
   + Sobel, default), and **AI Material Decomposition** — monocular depth from
   Depth Anything V2 drives the height map, so the normal, AO and bump maps
@@ -49,7 +60,16 @@ texture-generator/
   a photo arrived with, so the base color is closer to true albedo. The de-lit
   image becomes `base_color.png` itself, and every other map is derived from it.
   Works with any engine; when the AI engine is on, the depth map guides it so
-  shading does not bleed across object outlines.
+  shading does not bleed across object outlines. Off by default and, when
+  switched on, at full strength — the switch is a per-session decision because
+  it rewrites the source every other map is derived from.
+- **Bump at 8 or 16 bits.** `bump.png` defaults to 8-bit, which is what engines
+  and Blender take without a second thought; 16-bit keeps 256× the height steps
+  for displacement or for judging the relief itself. Both use the same mapping,
+  so switching depth never changes the look — only how much of it survives the
+  file. The normal map is unaffected and stays 8-bit.
+- Relief strength has a **Reset** button next to it; 100% is the setting that
+  exports the height field as measured, with no extra gain.
 - Styles: Realistic and Anime/Cel-shaded (hard posterize + RGB Sobel outline).
 - 3D material-ball preview with normal-only / bump-only isolation views.
 - Blender import: live into the current session via `tg_blender_link`

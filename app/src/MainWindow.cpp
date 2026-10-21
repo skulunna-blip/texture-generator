@@ -49,6 +49,16 @@
 
 namespace
 {
+// From project() in CMakeLists.txt. Kept in the title bar so a screenshot or a
+// bug report carries the build it came from.
+#ifndef TG_APP_VERSION
+#define TG_APP_VERSION "dev"
+#endif
+constexpr const char* kAppVersion = TG_APP_VERSION;
+
+// The relief slider's neutral position: gain 1, the height field as measured.
+constexpr int kBumpDefault = 100;
+
 // Swallows mouse-wheel events on the widget it is installed on, so sliders
 // (which natively change their value on wheel) only respond to drag + click.
 class WheelIgnoreFilter : public QObject
@@ -414,6 +424,25 @@ MainWindow::MainWindow(QWidget* parent)
         }
         QToolButton#sectionToggle:checked {
             color: #f7f3eb;
+        }
+        /* Sits on the slider's own header row, so it has to stay the height of
+           the value label next to it instead of taking a row of its own. */
+        QToolButton#inlineReset {
+            background: transparent;
+            border: 1px solid #344050;
+            border-radius: 4px;
+            color: #98a6b8;
+            font-size: 11px;
+            padding: 1px 7px;
+            margin-left: 6px;
+        }
+        QToolButton#inlineReset:hover {
+            background: #27303c;
+            border-color: #5a98ec;
+            color: #f7f3eb;
+        }
+        QToolButton#inlineReset:pressed {
+            background: #1b2129;
         }
         QLabel[role="muted"] {
             color: #98a6b8;
@@ -863,12 +892,26 @@ QWidget* MainWindow::buildSidebar()
     bumpRow->addWidget(m_bumpTitleLabel);
     bumpRow->addStretch(1);
     bumpRow->addWidget(m_bumpValueLabel);
+    // Getting back to the neutral gain otherwise means dragging until a number
+    // that is not marked anywhere shows up. The slider's range runs 20..300 and
+    // 100 sits a quarter of the way in, so there is nothing to aim at by eye.
+    m_bumpResetButton = new QToolButton;
+    m_bumpResetButton->setObjectName(QStringLiteral("inlineReset"));
+    m_bumpResetButton->setCursor(Qt::PointingHandCursor);
+    m_bumpResetButton->setAutoRaise(true);
+    connect(m_bumpResetButton, &QToolButton::clicked, this, [this]() {
+        m_bumpSlider->setValue(kBumpDefault);
+        // setValue() is a no-op when the slider is already at the default and
+        // then emits nothing, so the preview would keep whatever it had.
+        scheduleLivePreview();
+    });
+    bumpRow->addWidget(m_bumpResetButton);
     settingsLayout->addLayout(bumpRow);
 
     m_bumpSlider = new QSlider(Qt::Horizontal);
     m_bumpSlider->installEventFilter(new WheelIgnoreFilter(m_bumpSlider));
     m_bumpSlider->setRange(20, 300);
-    m_bumpSlider->setValue(100);
+    m_bumpSlider->setValue(kBumpDefault);
     connect(m_bumpSlider, &QSlider::valueChanged, this, &MainWindow::updateBumpLabel);
     // While dragging, recompute at a reduced resolution so the preview keeps up
     // with the mouse; the full-res pass runs once on release.
@@ -878,6 +921,32 @@ QWidget* MainWindow::buildSidebar()
         scheduleLivePreview();
     });
     settingsLayout->addWidget(m_bumpSlider);
+
+    // Bit depth of the exported bump.png. 8 stays the default because that is
+    // what engines and Blender's image importer take without a second thought;
+    // 16 exists for the cases where the bump is the thing being judged, and for
+    // anyone feeding it to a displacement node, where 256 steps over a real
+    // surface reads as terraces.
+    m_bumpBitsCombo = new QComboBox;
+    m_bumpBitsCombo->installEventFilter(new WheelIgnoreFilter(m_bumpBitsCombo));
+    m_bumpBitsCombo->addItem(QString(), 8);
+    m_bumpBitsCombo->addItem(QString(), 16);
+    connect(m_bumpBitsCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+                settings.setValue(QStringLiteral("bump/bits"), m_bumpBitsCombo->currentData().toInt());
+                scheduleLivePreview();
+            });
+    settingsLayout->addWidget(m_bumpBitsCombo);
+    {
+        QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+        const int bits = settings.value(QStringLiteral("bump/bits"), 8).toInt();
+        const QSignalBlocker blocker(m_bumpBitsCombo);
+        const int index = m_bumpBitsCombo->findData(bits);
+        m_bumpBitsCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
 
     m_squareCheck = new QCheckBox;
     m_squareCheck->setChecked(true);
@@ -981,7 +1050,10 @@ QWidget* MainWindow::buildSidebar()
     m_delightSlider = new QSlider(Qt::Horizontal);
     m_delightSlider->installEventFilter(new WheelIgnoreFilter(m_delightSlider));
     m_delightSlider->setRange(0, 100);
-    m_delightSlider->setValue(80);
+    // Full strength. De-lighting is off by default and is a deliberate choice
+    // when it is on, so half-measures are not what a user who just switched it
+    // on wants to get; the slider is there to dial it back afterwards.
+    m_delightSlider->setValue(100);
     connect(m_delightSlider, &QSlider::valueChanged, this, &MainWindow::updateDelightLabel);
     connect(m_delightSlider, &QSlider::sliderPressed, this, [this]() { m_draggingPreview = true; });
     connect(m_delightSlider, &QSlider::sliderReleased, this, [this]() {
@@ -994,15 +1066,15 @@ QWidget* MainWindow::buildSidebar()
     updateBumpLabel(m_bumpSlider->value());
     updateDelightLabel(m_delightSlider->value());
 
-    // Restore the de-lighting preferences; they are written back on every
-    // change so the choice survives a restart like the output folder does.
+    // De-lighting starts off at full strength every session rather than being
+    // remembered. It rewrites the base color that every other map is derived
+    // from, so a run that left it on would silently change the result of the
+    // next one; the switch has to be a decision taken in this session. Only the
+    // preview toggle is restored, since it costs time rather than changing the
+    // images.
     {
         QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
-        const QSignalBlocker delightBlocker(m_delightCheck);
-        const QSignalBlocker sliderBlocker(m_delightSlider);
         const QSignalBlocker previewBlocker(m_aiPreviewCheck);
-        m_delightCheck->setChecked(settings.value(QStringLiteral("delight/enabled"), false).toBool());
-        m_delightSlider->setValue(settings.value(QStringLiteral("delight/strength"), 80).toInt());
         m_aiPreviewCheck->setChecked(settings.value(QStringLiteral("ai/preview"), false).toBool());
     }
     refreshDelightState();
@@ -1895,9 +1967,9 @@ void MainWindow::handleUpscaleFinished()
 
 void MainWindow::saveDelightSettings()
 {
+    // Only the preview toggle is remembered; see the note where the de-lighting
+    // controls are restored in the constructor for why the switch is not.
     QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
-    settings.setValue(QStringLiteral("delight/enabled"), m_delightCheck && m_delightCheck->isChecked());
-    settings.setValue(QStringLiteral("delight/strength"), m_delightSlider ? m_delightSlider->value() : 80);
     settings.setValue(QStringLiteral("ai/preview"), m_aiPreviewCheck && m_aiPreviewCheck->isChecked());
 }
 
@@ -2092,7 +2164,8 @@ QString MainWindow::uiText(const QString& zh, const QString& en) const
 
 void MainWindow::refreshUiText()
 {
-    setWindowTitle(uiText(QStringLiteral("贴图生成器"), QStringLiteral("Texture Generator")));
+    setWindowTitle(uiText(QStringLiteral("贴图生成器"), QStringLiteral("Texture Generator"))
+                   + QStringLiteral(" ") + QString::fromLatin1(kAppVersion));
 
     if (m_brandEyebrowLabel) {
         m_brandEyebrowLabel->setText(uiText(QStringLiteral("桌面贴图工作台"), QStringLiteral("Desktop Texture Workbench")));
@@ -2292,6 +2365,34 @@ void MainWindow::refreshUiText()
                    QStringLiteral("Amplitude of the surface relief. Bump, normal, AO and "
                                   "roughness all come from the same height field, so this one "
                                   "slider changes all four maps.")));
+    }
+    if (m_bumpResetButton) {
+        m_bumpResetButton->setText(uiText(QStringLiteral("重置"), QStringLiteral("Reset")));
+        m_bumpResetButton->setToolTip(
+            uiText(QStringLiteral("把起伏强度恢复到默认的 100%（这一档就是实测高度，不做额外放大或压缩）。"),
+                   QStringLiteral("Puts the relief strength back to its default 100%, the "
+                                  "setting that exports the height field as measured, with no "
+                                  "extra gain.")));
+    }
+    if (m_bumpBitsCombo) {
+        const int bits8 = m_bumpBitsCombo->findData(8);
+        const int bits16 = m_bumpBitsCombo->findData(16);
+        if (bits8 >= 0) {
+            m_bumpBitsCombo->setItemText(bits8, uiText(QStringLiteral("凹凸位深：8 位 PNG"),
+                                                       QStringLiteral("Bump depth: 8-bit PNG")));
+        }
+        if (bits16 >= 0) {
+            m_bumpBitsCombo->setItemText(bits16, uiText(QStringLiteral("凹凸位深：16 位 PNG"),
+                                                        QStringLiteral("Bump depth: 16-bit PNG")));
+        }
+        m_bumpBitsCombo->setToolTip(
+            uiText(QStringLiteral("bump.png 存成多少位。8 位是游戏引擎和 Blender 默认读的格式，文件也小；"
+                                  "16 位保留 256 倍的高度台阶，适合直接连位移，或者只是想看凹凸本身有多细。"
+                                  "法线图不受影响，仍是 8 位。"),
+                   QStringLiteral("Bit depth of bump.png. 8-bit is what engines and Blender take "
+                                  "by default and keeps the file small; 16-bit keeps 256 times as "
+                                  "many height steps, for driving displacement or for judging the "
+                                  "relief itself. The normal map is unaffected and stays 8-bit.")));
     }
     if (m_delightSectionLabel) {
         m_delightSectionLabel->setText(uiText(QStringLiteral("去光影"), QStringLiteral("De-lighting")));
@@ -2746,6 +2847,7 @@ TextureOptions MainWindow::gatherOptions() const
     // different surface from the AO and roughness maps whenever the two values
     // differed.
     options.bumpStrength = m_bumpSlider ? static_cast<double>(m_bumpSlider->value()) / 100.0 : 1.0;
+    options.bumpBits = m_bumpBitsCombo ? m_bumpBitsCombo->currentData().toInt() : 8;
     options.normalStrength = 1.0;
     options.generateBaseColor = m_baseCheck && m_baseCheck->isChecked();
     options.generateBump = m_bumpCheck && m_bumpCheck->isChecked();
@@ -2757,7 +2859,7 @@ TextureOptions MainWindow::gatherOptions() const
     options.backendMode = selectedBackendMode();
     options.styleMode = selectedStyleMode();
     options.removeLighting = m_delightCheck && m_delightCheck->isChecked();
-    options.delightStrength = m_delightSlider ? static_cast<double>(m_delightSlider->value()) / 100.0 : 0.8;
+    options.delightStrength = m_delightSlider ? static_cast<double>(m_delightSlider->value()) / 100.0 : 1.0;
     options.aiPreview = m_aiPreviewCheck && m_aiPreviewCheck->isChecked();
     return options;
 }

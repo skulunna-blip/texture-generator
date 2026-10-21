@@ -180,6 +180,8 @@ private:
     QTabBar* m_tabBar = nullptr;
 
     QSlider* m_bumpSlider = nullptr;
+    QToolButton* m_bumpResetButton = nullptr;
+    QComboBox* m_bumpBitsCombo = nullptr;
     QSlider* m_delightSlider = nullptr;
 
     QCheckBox* m_squareCheck = nullptr;

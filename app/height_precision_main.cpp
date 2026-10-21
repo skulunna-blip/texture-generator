@@ -22,6 +22,7 @@
 
 #include <QCoreApplication>
 #include <QImage>
+#include <QTemporaryDir>
 
 #include <cmath>
 #include <cstdio>
@@ -451,6 +452,166 @@ int main(int argc, char** argv)
               QStringLiteral("stddev %1 at gain 1.0, %2 at gain 0.5")
                   .arg(full, 0, 'f', 2)
                   .arg(half, 0, 'f', 2));
+    }
+
+    // --- 5. A high gain rolls the tails off instead of clipping them -------
+    // The export used to be a plain multiply around mid-grey with saturate()
+    // after it, so every pixel the multiply pushed past an end became one flat
+    // value. That is invisible on a symmetric test wave but not on a surface
+    // whose bulk sits above mid-grey - a tiled floor photographed from above,
+    // which is the source this was reported on: gain 2 flattened 27% of the
+    // map to white and gain 3 flattened 70%. The export now expands around the
+    // field's median and spends a slope-matched shoulder on the tails, so the
+    // same gain reaches the same contrast without a plateau.
+    //
+    // The source below is deliberately skewed the same way: a bright surface
+    // with thin dark grooves. On it the old mapping put 44% of the map at pure
+    // white by gain 3 (70% on the photograph that was reported); this one
+    // measures about 8%.
+    {
+        QImage skewed(kSize, kSize, QImage::Format_RGB32);
+        for (int y = 0; y < kSize; ++y) {
+            for (int x = 0; x < kSize; ++x) {
+                const int v = (x % 64 < 3 || y % 64 < 3) ? 20 : 200;
+                skewed.setPixel(x, y, qRgb(v, v, v));
+            }
+        }
+
+        auto exportShare = [&](double gain, double* white, double* black) {
+            TextureOptions local;
+            local.resolution = kSize;
+            local.bumpStrength = gain;
+            local.generateBaseColor = false;
+            local.generateNormal = false;
+            local.generateRoughness = false;
+            local.generateMetal = false;
+            local.generateAo = false;
+            local.generateAlpha = false;
+            const QImage bump = TextureGenerator::preview(skewed, local)
+                                    .images.value(QStringLiteral("bump"))
+                                    .convertToFormat(QImage::Format_Grayscale8);
+            if (bump.isNull()) {
+                *white = 1.0;
+                *black = 1.0;
+                return;
+            }
+            long long full = 0;
+            long long zero = 0;
+            for (int y = 0; y < bump.height(); ++y) {
+                const uchar* line = bump.constScanLine(y);
+                for (int x = 0; x < bump.width(); ++x) {
+                    full += line[x] == 255;
+                    zero += line[x] == 0;
+                }
+            }
+            const double total = double(bump.width()) * bump.height();
+            *white = 100.0 * full / total;
+            *black = 100.0 * zero / total;
+        };
+
+        double whiteOne = 0.0;
+        double blackOne = 0.0;
+        double whiteThree = 0.0;
+        double blackThree = 0.0;
+        exportShare(1.0, &whiteOne, &blackOne);
+        exportShare(3.0, &whiteThree, &blackThree);
+        check(whiteThree < 25.0, "a high gain does not clip the highlights flat",
+              QStringLiteral("pure white %1% at gain 1, %2% at gain 3, limit 25")
+                  .arg(whiteOne, 0, 'f', 1)
+                  .arg(whiteThree, 0, 'f', 1));
+        check(blackThree < 25.0, "a high gain does not clip the shadows flat",
+              QStringLiteral("pure black %1% at gain 1, %2% at gain 3, limit 25")
+                  .arg(blackOne, 0, 'f', 1)
+                  .arg(blackThree, 0, 'f', 1));
+    }
+
+    // --- 6. The 16-bit export is the same map at finer steps -----------------
+    // The bump is offered at 8 or 16 bits. Two things have to hold for that to
+    // be a choice of precision rather than a choice of look: both depths must
+    // describe the same surface, and the deeper one must actually keep more
+    // steps. The second half is not free - QImage saves 16-bit PNG only for
+    // Format_Grayscale16, and a bad conversion on the way out would silently
+    // come back as 8-bit with the option still present in the UI.
+    {
+        // The temporary directory has to outlive the call: a QTemporaryDir
+        // deletes its contents on destruction, so one created inside the lambda
+        // would take bump.png with it before the caller could read it back.
+        QTemporaryDir written;
+
+        auto generateBump = [&](int bits, QString* savedPath) {
+            TextureOptions local;
+            local.resolution = kSize;
+            local.bumpBits = bits;
+            local.generateBaseColor = false;
+            local.generateNormal = false;
+            local.generateRoughness = false;
+            local.generateMetal = false;
+            local.generateAo = false;
+            local.generateAlpha = false;
+            if (savedPath == nullptr) {
+                return TextureGenerator::preview(makeTexturedSource(), local)
+                    .images.value(QStringLiteral("bump"));
+            }
+            const TextureResult result = TextureGenerator::generate(makeTexturedSource(), local, written.path());
+            *savedPath = result.filePaths.value(QStringLiteral("bump"));
+            return result.images.value(QStringLiteral("bump"));
+        };
+
+        const QImage eight = generateBump(8, nullptr);
+        const QImage sixteen = generateBump(16, nullptr);
+        check(!eight.isNull() && !sixteen.isNull(), "both bump depths produced a map");
+        check(eight.format() == QImage::Format_Grayscale8 && sixteen.format() == QImage::Format_Grayscale16,
+              "each bump depth exports in its own format");
+
+        if (!eight.isNull() && !sixteen.isNull() && eight.size() == sixteen.size()) {
+            // Same surface: every 16-bit sample has to sit within one 8-bit step
+            // of the 8-bit sample at the same pixel. A mapping that drifted
+            // between the two (a different gain, a different centring) fails
+            // here rather than showing up as "the 16-bit one looks darker".
+            double worst = 0.0;
+            std::vector<int> seen8(256, 0);
+            std::vector<int> seen16hi(65536, 0);
+            long levels8 = 0;
+            long levels16 = 0;
+            for (int y = 0; y < eight.height(); ++y) {
+                const uchar* line8 = eight.constScanLine(y);
+                const quint16* line16 = reinterpret_cast<const quint16*>(sixteen.constScanLine(y));
+                for (int x = 0; x < eight.width(); ++x) {
+                    worst = std::max(worst, std::abs(line16[x] / 65535.0 - line8[x] / 255.0));
+                    if (!seen8[line8[x]]++) {
+                        ++levels8;
+                    }
+                    if (!seen16hi[line16[x]]++) {
+                        ++levels16;
+                    }
+                }
+            }
+            // The 8-bit sample truncates and the 16-bit one rounds, so the two
+            // can be a whole 8-bit step apart on the same value plus half a
+            // 16-bit step of its own rounding.
+            const double kStepSlack = 1.0 / 255.0 + 1.0 / 131070.0;
+            check(worst <= kStepSlack, "16-bit and 8-bit agree on the surface",
+                  QStringLiteral("worst sample difference %1 of full range, limit %2")
+                      .arg(worst, 0, 'f', 5)
+                      .arg(kStepSlack, 0, 'f', 5));
+            check(levels16 >= levels8 * 4, "16-bit keeps finer height steps",
+                  QStringLiteral("%1 distinct levels at 8 bits, %2 at 16 bits, floor 4x")
+                      .arg(levels8)
+                      .arg(levels16));
+        }
+
+        // Round-trip through the writer: this is the half that catches a
+        // QImage format the PNG handler cannot store losslessly.
+        QString path;
+        const QImage ignored = generateBump(16, &path);
+        Q_UNUSED(ignored)
+        QImage reread;
+        const bool loaded = !path.isEmpty() && reread.load(path);
+        check(loaded && reread.format() == QImage::Format_Grayscale16,
+              "16-bit bump survives the PNG round-trip",
+              QStringLiteral("re-read format %1, expected %2")
+                  .arg(reread.isNull() ? -1 : int(reread.format()))
+                  .arg(int(QImage::Format_Grayscale16)));
     }
 
     std::printf("HEIGHT %s (%d failure%s)\n", failures == 0 ? "ALL PASS" : "FAILED", failures,

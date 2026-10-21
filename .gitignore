@@ -38,6 +38,7 @@ app/tools/realesrgan-ncnn-vulkan/
 /rot_*.png
 /shape_*.png
 /patch_*.png
+/vorient_*.png
 app/orient.png
 app/rot_*.png
 app/shape_*.png

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(TextureGeneratorQt VERSION 0.1 LANGUAGES CXX)
+project(TextureGeneratorQt VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,6 +56,10 @@ target_compile_definitions(TextureGeneratorQt
     PRIVATE
         QT_NO_CAST_FROM_ASCII
         QT_NO_CAST_TO_ASCII
+        # Shown in the window title so a bug report says which build it is
+        # about; the source of truth is the project() version above and the
+        # matching git tag.
+        TG_APP_VERSION="${PROJECT_VERSION}"
 )
 
 # ONNX Runtime is dlopen'd at run time rather than linked, so it just has to sit

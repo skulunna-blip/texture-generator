@@ -266,13 +266,19 @@ struct HeightLevels
 {
     double low = 0.0;
     double stretch = 1.0;
+    // Median of the levelled field: the height most of the surface sits at.
+    // Only the bump export uses it (the normal map needs the stretch alone),
+    // and only above gain 1, where expanding around mid-grey would push a
+    // surface that does not sit at mid-grey - a tiled floor photographed from
+    // above, for instance - into the top of the range and clip it there.
+    double median = 0.5;
 };
 HeightLevels heightLevels(const HeightField& field);
 
 // The 8-bit image is an export format, not part of the computation. This is the
 // only place the height field is allowed to lose precision. Defined below
 // scaledRadius so it can use saturate().
-QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain);
+QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain, int bits);
 
 QString timeStampedJobId()
 {
@@ -361,10 +367,11 @@ HeightLevels heightLevels(const HeightField& field)
     const double high = percentile(0.99);
     const double range = high - levels.low;
     levels.stretch = range > 1e-6 ? std::min(1.0 / range, kMaxStretch) : kMaxStretch;
+    levels.median = (percentile(0.5) - levels.low) * levels.stretch;
     return levels;
 }
 
-QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain)
+QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain, int bits)
 {
     // The same two steps the normal map takes: auto-levels first, then the
     // relief slider as a plain contrast gain. Exporting the raw field instead
@@ -372,13 +379,82 @@ QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, 
     // not - the two disagreed about the same surface, and moving the slider
     // changed one and (after the leveling) not the other.
     const double clampedGain = std::clamp(gain, 0.0, 3.0);
-    QImage out(field.width, field.height, QImage::Format_Grayscale8);
+
+    // Up to gain 1 this is the plain stretch it always was, and the exported
+    // bytes are unchanged.
+    //
+    // Above 1 it is not: the plain stretch pushes everything outside the
+    // middle 1/gain band past the ends, and saturate() turns those regions
+    // into one value. On a tiled photograph that was 27% of the map flat white
+    // at gain 2 and 70% at gain 3, which reads as the relief having
+    // disappeared. The extra contrast is spent on the middle instead, with a
+    // slope-matched shoulder that rolls the tails off and keeps the map
+    // monotone, so no two heights share a byte except the one percent the
+    // percentiles already excluded.
+    //
+    // The expansion is centred on the field's median rather than on mid-grey.
+    // The gain multiplies the distance from that median, so the height most of
+    // the surface sits at stays where it is and only the relief around it
+    // grows. Centring on mid-grey instead moved the whole surface toward white
+    // as the gain rose - the other half of why high gain used to wash out.
+    //
+    // Histogram equalisation was measured on the same source as an
+    // alternative to both: it does spread the flat tile faces over four times
+    // the grey range (8.6 levels of variation inside a tile face became 41),
+    // but what it spreads is the surface mottle, and the result reads as
+    // speckle rather than relief. This keeps the source's contrast ratios and
+    // only stops the clipping: the same face variation measures 17 levels at
+    // gain 2 and 26 at gain 3.
+    const double mid = std::clamp(levels.median, 0.02, 0.98);
+    const double upper = 1.0 - mid;
+    const double lower = mid;
+    const double shoulder = clampedGain > 1.0 ? 0.15 * (1.0 - 1.0 / clampedGain) : 0.0;
+    // Exponent that makes the shoulder leave the linear part at the same slope
+    // it arrived with; only used when the shoulder exists.
+    const double shoulderPower = shoulder > 1e-9
+        ? (clampedGain - 1.0 + shoulder) / shoulder
+        : 1.0;
+
+    // 16-bit is the same mapping quantised finer, not a different one: the
+    // levels and the gain keep meaning exactly what they mean at 8-bit, so the
+    // two exports describe the same surface and only differ in how many steps
+    // of it survive. On a photograph the height field itself spans far more
+    // than 256 steps inside the percentile band, so at 8 bits neighbouring
+    // samples collapse onto the same byte and the file is flatter than the
+    // field was - which is the one thing an exported bump map must not be.
+    const bool wide = bits > 8;
+    QImage out(field.width,
+               field.height,
+               wide ? QImage::Format_Grayscale16 : QImage::Format_Grayscale8);
     for (int y = 0; y < field.height; ++y) {
         uchar* line = out.scanLine(y);
+        quint16* wideLine = wide ? reinterpret_cast<quint16*>(line) : nullptr;
         for (int x = 0; x < field.width; ++x) {
             const double level = (static_cast<double>(field.at(x, y)) - levels.low) * levels.stretch;
-            const double value = 0.5 + (level - 0.5) * clampedGain;
-            line[x] = static_cast<uchar>(saturate(value) * 255.0);
+            double value = 0.0;
+            if (shoulder <= 0.0) {
+                value = 0.5 + (level - 0.5) * clampedGain;
+            } else {
+                const double scale = level >= mid ? upper : lower;
+                const double u = scale > 1e-9 ? (level - mid) / scale : 0.0;
+                double magnitude = std::abs(u) * clampedGain;
+                if (magnitude > 1.0 - shoulder) {
+                    const double t = std::min(1.0, (magnitude - (1.0 - shoulder))
+                                                   / (clampedGain - (1.0 - shoulder)));
+                    magnitude = (1.0 - shoulder)
+                              + shoulder * (1.0 - std::pow(1.0 - t, shoulderPower));
+                }
+                const double shaped = u < 0.0 ? -magnitude : magnitude;
+                value = mid + shaped * (shaped >= 0.0 ? upper : lower);
+            }
+            const double level01 = saturate(value);
+            if (wideLine) {
+                wideLine[x] = static_cast<quint16>(level01 * 65535.0 + 0.5);
+            } else {
+                // Untouched from before the 16-bit option existed: the 8-bit
+                // bytes are the same ones every earlier release wrote.
+                line[x] = static_cast<uchar>(level01 * 255.0);
+            }
         }
     }
     return out;
@@ -556,7 +632,7 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
         storeImage(result,
                    QStringLiteral("bump"),
                    QStringLiteral("bump.png"),
-                   heightFieldToImage(height, levels, options.bumpStrength),
+                   heightFieldToImage(height, levels, options.bumpStrength, options.bumpBits),
                    writeFiles);
     }
 
