@@ -17,6 +17,7 @@ class QDragEnterEvent;
 class QDragLeaveEvent;
 class QDropEvent;
 class QLabel;
+class QProgressBar;
 class QPushButton;
 class QResizeEvent;
 class QSlider;
@@ -103,6 +104,10 @@ private:
     bool m_draggingPreview = false;
     bool m_upscaling = false;
     int m_lastUpscaleScale = 0;
+    // Identity of the source the running upscale started from. A drop during
+    // the minutes-long inference replaces the source; the result of the old one
+    // must not land on the new picture.
+    qint64 m_upscaleSourceKey = 0;
 
     QSplitter* m_rootSplitter = nullptr;
     QSplitter* m_previewSplitter = nullptr;
@@ -163,9 +168,11 @@ private:
     QPushButton* m_downloadFolderButton = nullptr;
     QPushButton* m_upscaleButton = nullptr;
     QPushButton* m_upscaleDownloadButton = nullptr;
+    QProgressBar* m_upscaleProgress = nullptr;
 
     QComboBox* m_languageCombo = nullptr;
     QComboBox* m_backendCombo = nullptr;
+    bool m_backendChosen = false;
     QComboBox* m_styleCombo = nullptr;
     QComboBox* m_blenderVersionCombo = nullptr;
     QComboBox* m_upscaleScaleCombo = nullptr;
@@ -176,7 +183,9 @@ private:
     QSlider* m_delightSlider = nullptr;
 
     QCheckBox* m_squareCheck = nullptr;
+    QComboBox* m_squareFitCombo = nullptr;
     QCheckBox* m_seamlessCheck = nullptr;
+    QComboBox* m_seamlessModeCombo = nullptr;
     QCheckBox* m_delightCheck = nullptr;
     QCheckBox* m_aiPreviewCheck = nullptr;
     QCheckBox* m_baseCheck = nullptr;

@@ -24,6 +24,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QPixmap>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QResizeEvent>
@@ -881,10 +882,75 @@ QWidget* MainWindow::buildSidebar()
     m_squareCheck = new QCheckBox;
     m_squareCheck->setChecked(true);
     m_seamlessCheck = new QCheckBox;
+
+    // How the square is reached. Cropping keeps the aspect ratio and loses the
+    // long edges; stretching keeps everything and distorts. Bitmap2Material
+    // documents the second, and it is the default here for the same reason
+    // Bitmap2Material chose it: the source of a tiling texture is almost always
+    // already square-ish, so the distortion is small, whereas cropping throws
+    // away a third of a 4:3 photo - content the user cannot get back. Both stay
+    // one click apart either way.
+    m_squareFitCombo = new QComboBox;
+    m_squareFitCombo->installEventFilter(new WheelIgnoreFilter(m_squareFitCombo));
+    m_squareFitCombo->addItem(QString(), static_cast<int>(SquareFit::Crop));
+    m_squareFitCombo->addItem(QString(), static_cast<int>(SquareFit::Stretch));
+    m_squareFitCombo->addItem(QString(), static_cast<int>(SquareFit::Mirror));
+    m_squareFitCombo->addItem(QString(), static_cast<int>(SquareFit::Resynthesize));
+    m_squareFitCombo->addItem(QString(), static_cast<int>(SquareFit::SeamCarve));
+    m_squareFitCombo->setCurrentIndex(m_squareFitCombo->findData(static_cast<int>(SquareFit::Stretch)));
+    connect(m_squareFitCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) { scheduleLivePreview(); });
+
+    // Which engine removes the seam. Blend is the original pyramid blend and
+    // stays the default; the two patch modes synthesize the band around the
+    // seam instead of averaging across it, which is the only way structure
+    // (a grout line, a board edge) survives the wrap.
+    m_seamlessModeCombo = new QComboBox;
+    m_seamlessModeCombo->installEventFilter(new WheelIgnoreFilter(m_seamlessModeCombo));
+    m_seamlessModeCombo->addItem(QString(), static_cast<int>(SeamlessMode::Blend));
+    m_seamlessModeCombo->addItem(QString(), static_cast<int>(SeamlessMode::PatchMatch));
+    m_seamlessModeCombo->addItem(QString(), static_cast<int>(SeamlessMode::Gpnn));
+    m_seamlessModeCombo->addItem(QString(), static_cast<int>(SeamlessMode::Resynthesizer));
+    m_seamlessModeCombo->addItem(QString(), static_cast<int>(SeamlessMode::Mirror));
+    m_seamlessModeCombo->setEnabled(false); // meaningless until seamless is on
+    connect(m_seamlessModeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+                settings.setValue(QStringLiteral("seamless/mode"), m_seamlessModeCombo->currentData().toInt());
+                scheduleLivePreview();
+            });
+
     connect(m_squareCheck, &QCheckBox::toggled, this, &MainWindow::scheduleLivePreview);
     connect(m_seamlessCheck, &QCheckBox::toggled, this, &MainWindow::scheduleLivePreview);
+    connect(m_seamlessCheck, &QCheckBox::toggled, this, [this](bool on) {
+        if (m_seamlessModeCombo) {
+            m_seamlessModeCombo->setEnabled(on);
+        }
+        QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+        settings.setValue(QStringLiteral("seamless/enabled"), on);
+    });
     settingsLayout->addWidget(m_squareCheck);
+    settingsLayout->addWidget(m_squareFitCombo);
     settingsLayout->addWidget(m_seamlessCheck);
+    settingsLayout->addWidget(m_seamlessModeCombo);
+
+    // Restore the last engine and the checkbox that owns it.
+    {
+        QSettings settings(QStringLiteral("TextureGeneratorQt"), QStringLiteral("TextureGeneratorQt"));
+        const int savedMode = settings.value(QStringLiteral("seamless/mode"),
+                                             static_cast<int>(SeamlessMode::Blend)).toInt();
+        const int restoredIndex = m_seamlessModeCombo->findData(savedMode);
+        const QSignalBlocker modeBlocker(m_seamlessModeCombo);
+        m_seamlessModeCombo->setCurrentIndex(restoredIndex >= 0 ? restoredIndex : 0);
+        const bool seamlessOn = settings.value(QStringLiteral("seamless/enabled"), false).toBool();
+        const QSignalBlocker seamBlocker(m_seamlessCheck);
+        m_seamlessCheck->setChecked(seamlessOn);
+        m_seamlessModeCombo->setEnabled(seamlessOn);
+    }
 
     // De-lighting gets its own header because it is not one more
     // surface-detail dial: it rewrites the source image that every later stage
@@ -951,8 +1017,8 @@ QWidget* MainWindow::buildSidebar()
 
     auto* upscaleBody = new QWidget(upscalePanel);
     m_upscaleToggleButton = makeSectionToggle(upscaleBody);
-    m_upscaleToggleButton->setText(uiText(QStringLiteral("超分放大（Real-ESRGAN）"),
-                                          QStringLiteral("AI Upscale (Real-ESRGAN)")));
+    m_upscaleToggleButton->setText(uiText(QStringLiteral("源图超分放大（Real-ESRGAN）"),
+                                          QStringLiteral("Upscale the Source (Real-ESRGAN)")));
     upscaleOuter->addWidget(m_upscaleToggleButton);
     upscaleOuter->addWidget(upscaleBody);
 
@@ -992,6 +1058,16 @@ QWidget* MainWindow::buildSidebar()
     m_upscaleButton->setEnabled(false);
     connect(m_upscaleButton, &QPushButton::clicked, this, &MainWindow::startUpscale);
     upscaleLayout->addWidget(m_upscaleButton);
+
+    // Hidden until a run starts: the tool reports its own tiling progress, and
+    // a 2K map is minutes, so without this the window looked frozen even
+    // though it was working the whole time.
+    m_upscaleProgress = new QProgressBar;
+    m_upscaleProgress->setRange(0, 100);
+    m_upscaleProgress->setValue(0);
+    m_upscaleProgress->setTextVisible(true);
+    m_upscaleProgress->setVisible(false);
+    upscaleLayout->addWidget(m_upscaleProgress);
     layout->addWidget(upscalePanel);
 
     auto* blenderPanel = makePanel();
@@ -1311,14 +1387,50 @@ QWidget* MainWindow::buildWorkspace()
     return container;
 }
 
+// The image types this build can actually open. The dialog used to hard-code
+// "*.png *.jpg *.jpeg *.webp *.bmp", but the Qt this links against ships no
+// WebP plugin, so offering .webp there only produced "The image could not be
+// opened" after the user had picked one. Asking the reader keeps the offer
+// honest, and the same list is what the drop handler quotes when it refuses a
+// file, so the dialog and the drop message cannot drift apart.
+static QStringList readableImageSuffixes()
+{
+    // Ordered by how likely a texture source is to be one of them. A candidate
+    // this build cannot read is left out rather than advertised; if a plugin is
+    // added later (WebP, TIFF) it appears here with no other change.
+    static const QStringList candidates = {
+        QStringLiteral("png"),  QStringLiteral("jpg"),  QStringLiteral("jpeg"),
+        QStringLiteral("webp"), QStringLiteral("bmp"),  QStringLiteral("tif"),
+        QStringLiteral("tiff"), QStringLiteral("tga"),
+    };
+    const QList<QByteArray> supported = QImageReader::supportedImageFormats();
+    QStringList suffixes;
+    for (const QString& candidate : candidates) {
+        if (supported.contains(candidate.toLatin1())) {
+            suffixes.append(candidate);
+        }
+    }
+    return suffixes;
+}
+
+static QString imagePatterns()
+{
+    QStringList patterns;
+    for (const QString& suffix : readableImageSuffixes()) {
+        patterns.append(QStringLiteral("*.") + suffix);
+    }
+    return patterns.join(QLatin1Char(' '));
+}
+
 void MainWindow::openImage()
 {
+    const QString filter = uiText(QStringLiteral("图片文件 (%1)"), QStringLiteral("Images (%1)"))
+                               .arg(imagePatterns());
     const QString path = QFileDialog::getOpenFileName(
         this,
         uiText(QStringLiteral("选择图片"), QStringLiteral("Choose Image")),
         QString(),
-        uiText(QStringLiteral("图片文件 (*.png *.jpg *.jpeg *.webp *.bmp)"),
-               QStringLiteral("Images (*.png *.jpg *.jpeg *.webp *.bmp)")));
+        filter);
     if (path.isEmpty()) {
         return;
     }
@@ -1405,11 +1517,43 @@ void MainWindow::setDropHighlight(bool on)
 
 void MainWindow::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (firstImageInMime(event->mimeData()).isEmpty()) {
+    const QMimeData* mime = event->mimeData();
+    if (!firstImageInMime(mime).isEmpty()) {
+        event->acceptProposedAction();
+        setDropHighlight(true);
         return;
     }
-    event->acceptProposedAction();
-    setDropHighlight(true);
+
+    // A refused drop used to be completely silent - a "no entry" cursor and
+    // nothing else, which looks exactly like the feature being broken. The two
+    // reasons a real user runs into are worth telling apart, and the message
+    // bar is the only place a drag that is not going to be accepted can say
+    // anything at all.
+    if (!mime || !mime->hasUrls()) {
+        return;
+    }
+    bool anyLocal = false;
+    for (const QUrl& url : mime->urls()) {
+        if (url.isLocalFile()) {
+            anyLocal = true;
+            break;
+        }
+    }
+    if (anyLocal) {
+        setMessage(uiText(QStringLiteral("这个文件不是能读取的图片。支持：%1").arg(imagePatterns()),
+                          QStringLiteral("That file is not an image this build can read. Supported: %1")
+                              .arg(imagePatterns())));
+    } else {
+        // Dragging out of a .zip opened in Explorer, a browser page or a chat
+        // client gives the drag a file descriptor, not a path on disk, and
+        // Windows never puts one on the clipboard for us to read.
+        setMessage(uiText(
+            QStringLiteral("拖进来的不是磁盘上的文件。从压缩包、浏览器或聊天窗口拖出文件时 Windows "
+                           "不提供磁盘路径，请先保存到磁盘再拖入。"),
+            QStringLiteral("That drop carried no file on disk. Windows gives no path for files "
+                           "dragged out of an archive, a browser or a chat window - save them to "
+                           "disk first.")));
+    }
 }
 
 void MainWindow::dragLeaveEvent(QDragLeaveEvent* event)
@@ -1617,27 +1761,75 @@ void MainWindow::handleImportFinished()
 
 void MainWindow::startUpscale()
 {
-    if (m_upscaling || !UpscaleEngine::isAvailable()) {
+    if (m_upscaling || !UpscaleEngine::isAvailable() || m_sourceImage.isNull()) {
         refreshUpscaleState();
         return;
     }
-    if (m_result.images.isEmpty() || m_result.outputDirectory.isEmpty()) {
-        refreshUpscaleState();
+
+    // The engine works on files; the source only exists in memory. A temp copy
+    // is the whole hand-off - the upscaled result replaces the source image and
+    // everything downstream is generated from it.
+    const QString tempRoot = QDir(QDir::tempPath()).filePath(QStringLiteral("TextureGeneratorUpscale"));
+    if (!QDir().mkpath(tempRoot)) {
+        setMessage(uiText(QStringLiteral("无法创建临时目录，放大未开始。"),
+                          QStringLiteral("Could not create the temp folder; upscale did not start.")));
+        return;
+    }
+    const QString inputPath = QDir(tempRoot).filePath(QStringLiteral("source_in.png"));
+    const QString outputPath = QDir(tempRoot).filePath(QStringLiteral("source_out.png"));
+    QFile::remove(outputPath);
+    if (!m_sourceImage.save(inputPath, "PNG")) {
+        setMessage(uiText(QStringLiteral("无法写出源图临时文件，放大未开始。"),
+                          QStringLiteral("Could not write the temp source file; upscale did not start.")));
         return;
     }
 
     const int scale = m_upscaleScaleCombo ? m_upscaleScaleCombo->currentData().toInt() : 4;
     const StyleMode style = selectedStyleMode();
-    const QMap<QString, QString> sources = m_result.filePaths;
-    const QString outputRoot = m_result.outputDirectory;
 
     m_lastUpscaleScale = scale;
+    m_upscaleSourceKey = m_sourceImage.cacheKey();
     m_upscaling = true;
     refreshUpscaleState();
-    setMessage(uiText(QStringLiteral("正在把贴图放大到 %1x（AI 推理中）…").arg(scale),
-                      QStringLiteral("Upscaling the maps to %1x (AI inference)...").arg(scale)));
-    m_upscaleWatcher->setFuture(QtConcurrent::run([sources, outputRoot, scale, style]() {
-        return UpscaleEngine::upscale(sources, outputRoot, scale, style);
+    if (m_upscaleProgress) {
+        m_upscaleProgress->setValue(0);
+        m_upscaleProgress->setVisible(true);
+    }
+    setMessage(uiText(QStringLiteral("正在把源图放大到 %1x（AI 推理中）…").arg(scale),
+                      QStringLiteral("Upscaling the source to %1x (AI inference)...").arg(scale)));
+
+    m_upscaleWatcher->setFuture(QtConcurrent::run([this, inputPath, outputPath, scale, style]() {
+        // The engine runs on this worker thread; the progress callback hops
+        // back to the UI thread through the event loop. m_upscaling guards
+        // against a queued update arriving after the job already finished.
+        auto progress = [this](int percent, const QString& label) {
+            QMetaObject::invokeMethod(this, [this, percent, label]() {
+                if (!m_upscaling || !m_upscaleProgress) {
+                    return;
+                }
+                m_upscaleProgress->setVisible(true);
+                m_upscaleProgress->setValue(percent);
+                m_upscaleStatusLabel->setText(
+                    uiText(QStringLiteral("正在放大 %1  %2%").arg(label).arg(percent),
+                           QStringLiteral("Upscaling %1  %2%").arg(label).arg(percent)));
+            }, Qt::QueuedConnection);
+        };
+
+        UpscaleEngine::Result result;
+        QString error;
+        if (UpscaleEngine::upscaleImage(inputPath, outputPath, scale, style, progress, &error)) {
+            const QImage image(outputPath);
+            if (image.isNull()) {
+                result.error = QStringLiteral("放大结果无法读取。");
+            } else {
+                result.ok = true;
+                result.images.insert(QStringLiteral("source"), image);
+                result.filePaths.insert(QStringLiteral("source"), outputPath);
+            }
+        } else {
+            result.error = error;
+        }
+        return result;
     }));
 }
 
@@ -1645,33 +1837,60 @@ void MainWindow::handleUpscaleFinished()
 {
     const UpscaleEngine::Result upscaled = m_upscaleWatcher->result();
     m_upscaling = false;
+    if (m_upscaleProgress) {
+        m_upscaleProgress->setValue(0);
+        m_upscaleProgress->setVisible(false);
+    }
 
     if (!upscaled.ok) {
-        setMessage(upscaled.error);
+        setMessage(upscaled.error.isEmpty()
+                       ? uiText(QStringLiteral("放大失败。"), QStringLiteral("Upscale failed."))
+                       : upscaled.error);
         refreshUpscaleState();
         return;
     }
 
-    // The maps now live at the upscaled size; swap them in so the preview, the
-    // Blender export and the open-folder button all use the new resolution.
-    m_result.images = upscaled.images;
-    m_result.filePaths = upscaled.filePaths;
-    m_result.outputDirectory = upscaled.outputDirectory;
-    if (!upscaled.images.isEmpty()) {
-        m_result.size = upscaled.images.constBegin()->size();
+    // A drop during the run replaced the picture this result was computed from.
+    if (m_sourceImage.cacheKey() != m_upscaleSourceKey) {
+        setMessage(uiText(QStringLiteral("源图在放大期间被替换，这次放大结果已丢弃。"),
+                          QStringLiteral("The source was replaced while upscaling, so this result was discarded.")));
+        refreshUpscaleState();
+        return;
     }
+
+    const QImage upscaledSource = upscaled.images.value(QStringLiteral("source"));
+    if (upscaledSource.isNull()) {
+        setMessage(uiText(QStringLiteral("放大结果无法读取。"), QStringLiteral("The upscaled image could not be read.")));
+        refreshUpscaleState();
+        return;
+    }
+
+    // The source itself is now bigger, so every map is generated from the
+    // larger picture rather than from the original. Whatever was generated
+    // before belongs to the old source and is stale.
+    m_sourceImage = upscaledSource;
+    m_result = TextureResult();
     m_previewResult = TextureResult();
-    m_generatedMatchesCurrent = true;
-    m_downloadFolderButton->setEnabled(true);
+    m_generatedMatchesCurrent = false;
+    m_downloadFolderButton->setEnabled(false);
+    if (m_importButton) {
+        m_importButton->setEnabled(false);
+    }
+
     refreshBlenderStatus();
+    refreshInputPreview();
     refreshResultTitle();
     refreshVisiblePreview();
     refreshSizeSummary();
     refreshUpscaleState();
+    scheduleLivePreview();
 
-    const int scale = m_lastUpscaleScale > 0 ? m_lastUpscaleScale : 4;
-    setMessage(uiText(QStringLiteral("已完成 %1x 放大，当前预览和导出均为放大结果（法线图已直接采样保持精度）。").arg(scale),
-                      QStringLiteral("Upscaled %1x. Preview and export now use the larger maps (the normal map was resampled directly).").arg(scale)));
+    setMessage(uiText(QStringLiteral("源图已放大到 %1×%2，之后所有贴图都从这张生成（输出分辨率决定最终尺寸，放大只负责补细节）。")
+                          .arg(upscaledSource.width())
+                          .arg(upscaledSource.height()),
+                      QStringLiteral("Source upscaled to %1x%2. Every map is generated from it from now on (the output resolution still decides the final size; the upscale only adds detail).")
+                          .arg(upscaledSource.width())
+                          .arg(upscaledSource.height())));
 }
 
 void MainWindow::saveDelightSettings()
@@ -1704,7 +1923,7 @@ void MainWindow::refreshUpscaleState()
         return;
     }
 
-    const bool hasResult = !m_result.images.isEmpty();
+    const bool hasSource = !m_sourceImage.isNull();
     const bool binaryReady = UpscaleEngine::isAvailable();
     const int scale = m_upscaleScaleCombo ? m_upscaleScaleCombo->currentData().toInt() : 4;
     const QString modelName = (selectedStyleMode() == StyleMode::Anime)
@@ -1712,10 +1931,10 @@ void MainWindow::refreshUpscaleState()
         : uiText(QStringLiteral("真实模型（x4plus）"), QStringLiteral("realistic model (x4plus)"));
 
     if (m_upscaleButton) {
-        m_upscaleButton->setEnabled(hasResult && binaryReady && !m_upscaling);
+        m_upscaleButton->setEnabled(hasSource && binaryReady && !m_upscaling);
         m_upscaleButton->setText(m_upscaling
             ? uiText(QStringLiteral("放大中…"), QStringLiteral("Upscaling..."))
-            : uiText(QStringLiteral("放大输出到 %1x"), QStringLiteral("Upscale output to %1x")).arg(scale));
+            : uiText(QStringLiteral("把源图放大到 %1x"), QStringLiteral("Upscale the source to %1x")).arg(scale));
     }
     if (m_upscaleDownloadButton) {
         m_upscaleDownloadButton->setVisible(!binaryReady);
@@ -1728,14 +1947,17 @@ void MainWindow::refreshUpscaleState()
             QStringLiteral("Real-ESRGAN 未安装。点击下方按钮打开下载页，解压 zip 到 tools/realesrgan-ncnn-vulkan/ 后重启应用；也可直接运行项目里的 _get_realesrgan.ps1。"),
             QStringLiteral("Real-ESRGAN is not bundled. Open the download page, extract the zip into tools/realesrgan-ncnn-vulkan/ and restart; or run _get_realesrgan.ps1 in the project.")));
     } else if (m_upscaling) {
-        m_upscaleStatusLabel->setText(uiText(QStringLiteral("正在放大…（AI 推理需几秒到十几秒）"),
-                                             QStringLiteral("Upscaling... (AI inference takes a few seconds)")));
-    } else if (!hasResult) {
-        m_upscaleStatusLabel->setText(uiText(QStringLiteral("先生成贴图，再用 %1 放大到 %2x。").arg(modelName).arg(scale),
-                                             QStringLiteral("Generate maps first, then upscale to %2x with %1.").arg(modelName).arg(scale)));
+        m_upscaleStatusLabel->setText(uiText(QStringLiteral("正在放大…（AI 推理，按显卡可能要几分钟）"),
+                                             QStringLiteral("Upscaling... (AI inference; minutes on a slow GPU)")));
+    } else if (!hasSource) {
+        m_upscaleStatusLabel->setText(uiText(QStringLiteral("先拖入一张源图，再用 %1 放大到 %2x。").arg(modelName).arg(scale),
+                                             QStringLiteral("Load a source image first, then upscale it to %2x with %1.").arg(modelName).arg(scale)));
     } else {
-        m_upscaleStatusLabel->setText(uiText(QStringLiteral("已就绪：用 %1 放大到 %2x。").arg(modelName).arg(scale),
-                                             QStringLiteral("Ready: upscale to %2x with %1.").arg(modelName).arg(scale)));
+        m_upscaleStatusLabel->setText(uiText(
+            QStringLiteral("当前源图 %1×%2。放大的是这张源图，之后的全部贴图都从放大结果生成——不是把成品再拉大。")
+                .arg(m_sourceImage.width()).arg(m_sourceImage.height()),
+            QStringLiteral("Source is %1x%2. The source is what gets upscaled; every map is then generated from it - the generated maps are not enlarged afterwards.")
+                .arg(m_sourceImage.width()).arg(m_sourceImage.height())));
     }
 }
 
@@ -1818,8 +2040,15 @@ void MainWindow::refreshLivePreview()
 
     const QImage source = m_sourceImage;
     TextureOptions options = gatherOptions();
-    if (m_draggingPreview) {
-        options.resolution = 512;
+    // The patch-based seamless engines cost seconds at 1024 (5.4 s measured for
+    // PatchMatch, 3.5 s for the Resynthesizer cross) and this runs on every
+    // slider tick, so they preview at half that. Blend and Mirror are linear and
+    // keep the full size. Generate always builds at the chosen resolution.
+    const bool patchEngine = options.seamless
+        && options.seamlessMode != SeamlessMode::Blend
+        && options.seamlessMode != SeamlessMode::Mirror;
+    if (m_draggingPreview || patchEngine) {
+        options.resolution = std::min(options.resolution, 512);
     }
     if (!TextureGenerator::isBackendAvailable(options.backendMode)) {
         m_previewResult = TextureResult();
@@ -1962,16 +2191,95 @@ void MainWindow::refreshUiText()
         }
 
         int index = m_backendCombo->findData(static_cast<int>(currentMode));
+        if (!m_backendChosen) {
+            // First population in this session and no explicit choice yet: the
+            // depth model ships with the app, so start on the path that uses
+            // it. Users who prefer the classic chain can still pick it; that
+            // choice then survives language switches, which rebuild this list.
+            const TextureBackendMode preferred =
+                TextureGenerator::isBackendAvailable(TextureBackendMode::AiBridge)
+                    ? TextureBackendMode::AiBridge
+                    : TextureBackendMode::EnhancedDetail;
+            index = m_backendCombo->findData(static_cast<int>(preferred));
+        }
         if (index < 0 || !TextureGenerator::isBackendAvailable(currentMode)) {
             index = m_backendCombo->findData(static_cast<int>(TextureBackendMode::EnhancedDetail));
         }
+        m_backendChosen = true;
         m_backendCombo->setCurrentIndex(std::max(0, index));
     }
     if (m_squareCheck) {
         m_squareCheck->setText(uiText(QStringLiteral("强制 1:1"), QStringLiteral("Force 1:1")));
     }
+    if (m_squareFitCombo) {
+        const int cropIndex = m_squareFitCombo->findData(static_cast<int>(SquareFit::Crop));
+        const int stretchIndex = m_squareFitCombo->findData(static_cast<int>(SquareFit::Stretch));
+        if (cropIndex >= 0) {
+            m_squareFitCombo->setItemText(cropIndex, uiText(QStringLiteral("1:1 方式：居中裁切"),
+                                                           QStringLiteral("1:1: centre crop")));
+        }
+        if (stretchIndex >= 0) {
+            m_squareFitCombo->setItemText(stretchIndex, uiText(QStringLiteral("1:1 方式：拉伸（Bitmap2Material）"),
+                                                               QStringLiteral("1:1: stretch (B2M)")));
+        }
+        const int mirrorIndex = m_squareFitCombo->findData(static_cast<int>(SquareFit::Mirror));
+        if (mirrorIndex >= 0) {
+            m_squareFitCombo->setItemText(mirrorIndex, uiText(QStringLiteral("1:1 方式：镜像延展（不变形）"),
+                                                             QStringLiteral("1:1: mirror extend")));
+            m_squareFitCombo->setItemData(mirrorIndex, uiText(
+                QStringLiteral("短边靠镜像补齐，不拉伸也不裁掉内容；图案会出现对称。"),
+                QStringLiteral("Grow the short side by reflection: nothing is stretched or cropped, but the pattern becomes symmetric.")), Qt::ToolTipRole);
+        }
+        const int resynthIndex = m_squareFitCombo->findData(static_cast<int>(SquareFit::Resynthesize));
+        if (resynthIndex >= 0) {
+            m_squareFitCombo->setItemText(resynthIndex, uiText(QStringLiteral("1:1 方式：补丁合成补齐"),
+                                                              QStringLiteral("1:1: resynthesize")));
+            m_squareFitCombo->setItemData(resynthIndex, uiText(
+                QStringLiteral("短边用图里其它位置的补丁合成补上，会「编」出内容；比例差得少时最自然。"),
+                QStringLiteral("Grow the short side by synthesizing patches from elsewhere in the picture. Invents content; most believable when the gap is small.")), Qt::ToolTipRole);
+        }
+        const int carveIndex = m_squareFitCombo->findData(static_cast<int>(SquareFit::SeamCarve));
+        if (carveIndex >= 0) {
+            m_squareFitCombo->setItemText(carveIndex, uiText(QStringLiteral("1:1 方式：接缝裁剪（Liquid Rescale 思路）"),
+                                                            QStringLiteral("1:1: seam carve (Liquid Rescale style)")));
+            m_squareFitCombo->setItemData(carveIndex, uiText(
+                QStringLiteral("按内容删掉最不显眼的接缝线来缩边，不缩放也不裁掉整块；长直线会弯，比较慢。"),
+                QStringLiteral("Content-aware: cut the least noticeable seams until the sides match. No scaling and no block is lost, but long straight lines bend. Slow.")), Qt::ToolTipRole);
+        }
+    }
     if (m_seamlessCheck) {
         m_seamlessCheck->setText(uiText(QStringLiteral("生成无缝"), QStringLiteral("Make Seamless")));
+        m_seamlessCheck->setToolTip(uiText(
+            QStringLiteral("把图片做成可平铺。「融合」最快；「PatchMatch」「GPNN」「Resynthesizer」会用图里其它位置的补丁重画接缝，越往后越慢；「镜像折叠」瞬时但对折痕迹可见。"),
+            QStringLiteral("Make the texture tile. Blend is fastest; PatchMatch, GPNN and Resynthesizer redraw the seam from patches taken elsewhere (each slower than the last); mirror fold is instant but the symmetry shows.")));
+    }
+    if (m_seamlessModeCombo) {
+        const QSignalBlocker blocker(m_seamlessModeCombo);
+        if (m_seamlessModeCombo->count() > 0) {
+            m_seamlessModeCombo->setItemText(0, uiText(QStringLiteral("无缝方式：融合（最快）"), QStringLiteral("Seamless: Blend (fastest)")));
+        }
+        if (m_seamlessModeCombo->count() > 1) {
+            m_seamlessModeCombo->setItemText(1, uiText(QStringLiteral("无缝方式：PatchMatch"), QStringLiteral("Seamless: PatchMatch")));
+        }
+        if (m_seamlessModeCombo->count() > 2) {
+            m_seamlessModeCombo->setItemText(2, uiText(QStringLiteral("无缝方式：GPNN 多尺度"), QStringLiteral("Seamless: GPNN multi-scale")));
+        }
+        const int resynthIndex = m_seamlessModeCombo->findData(static_cast<int>(SeamlessMode::Resynthesizer));
+        if (resynthIndex >= 0) {
+            m_seamlessModeCombo->setItemText(resynthIndex, uiText(QStringLiteral("无缝方式：Resynthesizer（GIMP 做法）"),
+                                                                 QStringLiteral("Seamless: Resynthesizer (GIMP)")));
+            m_seamlessModeCombo->setItemData(resynthIndex, uiText(
+                QStringLiteral("先平移半张让接缝落在正中间，再合成中间那个十字形空洞，四边都有参考，比贴边那圈更好找补丁。慢。"),
+                QStringLiteral("Roll by half so the seam lands in the middle, then synthesize the cross-shaped hole there. Context on all four sides; slower.")), Qt::ToolTipRole);
+        }
+        const int mirrorIndex = m_seamlessModeCombo->findData(static_cast<int>(SeamlessMode::Mirror));
+        if (mirrorIndex >= 0) {
+            m_seamlessModeCombo->setItemText(mirrorIndex, uiText(QStringLiteral("无缝方式：镜像折叠（瞬时）"),
+                                                                QStringLiteral("Seamless: mirror fold (instant)")));
+            m_seamlessModeCombo->setItemData(mirrorIndex, uiText(
+                QStringLiteral("把图片对折成镜像对称，首尾天然对得上；细节全保留，但能看出对称。"),
+                QStringLiteral("Fold the picture onto itself so it is mirror-symmetric. Edges match by construction, no detail lost, but the symmetry is visible.")), Qt::ToolTipRole);
+        }
     }
     if (m_bumpTitleLabel) {
         m_bumpTitleLabel->setText(uiText(QStringLiteral("起伏强度"), QStringLiteral("Relief Strength")));
@@ -2071,8 +2379,8 @@ void MainWindow::refreshUiText()
         m_upscaleScaleCombo->setCurrentIndex(std::max(0, index));
     }
     if (m_upscaleToggleButton) {
-        m_upscaleToggleButton->setText(uiText(QStringLiteral("超分放大（Real-ESRGAN）"),
-                                              QStringLiteral("AI Upscale (Real-ESRGAN)")));
+        m_upscaleToggleButton->setText(uiText(QStringLiteral("源图超分放大（Real-ESRGAN）"),
+                                              QStringLiteral("Upscale the Source (Real-ESRGAN)")));
     }
     refreshUpscaleState();
     if (m_tabBar) {
@@ -2424,7 +2732,13 @@ TextureOptions MainWindow::gatherOptions() const
         ? m_resolutionGroup->checkedId()
         : 2048;
     options.square = m_squareCheck && m_squareCheck->isChecked();
+    if (m_squareFitCombo) {
+        options.squareFit = static_cast<SquareFit>(m_squareFitCombo->currentData().toInt());
+    }
     options.seamless = m_seamlessCheck && m_seamlessCheck->isChecked();
+    if (m_seamlessModeCombo) {
+        options.seamlessMode = static_cast<SeamlessMode>(m_seamlessModeCombo->currentData().toInt());
+    }
     // One slider drives the whole relief. It scales the height field, and the
     // bump, normal, AO and roughness maps are all derived from that same field,
     // so they always describe one surface. The normal gain stays neutral: it

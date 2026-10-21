@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace
@@ -339,6 +341,185 @@ Plane extreme1D(const Plane& src, int radius, bool wrap, bool wantMax, bool vert
 // mask in that stage reads about zero there and leaves the repair alone;
 // running it afterwards would have the two stages fighting over the same
 // pixels.
+// Illumination is a smooth field, and the nearest-pixel copy above is not.
+//
+// Copying luminance from the nearest known pixel is right for surface identity
+// (chromaticity) and wrong for light: two rim pixels on opposite sides of a
+// bright highlight can differ by a stop, and the copy puts a straight cliff
+// where their two cells meet. That cliff is the faceted wedge that survives
+// into the de-lit result - it is not a texture edge, it is where the fill
+// stopped interpolating and started tiling.
+//
+// A diffuse illumination field has no such edges, so the field is solved for
+// instead of copied: Laplace's equation over the hole, with the surrounding
+// rim as the boundary condition, gives the smoothest field consistent with
+// what the sensor did record. The two-pixel collar keeps the boundary values
+// off the pixels the fill just wrote.
+//
+// Chromaticity gets the same treatment. Its nearest-donor cells meet along the
+// same straight lines, and there the step shows up as a hue wedge rather than
+// a brightness one - the pale triangle in the middle of a filled highlight.
+// Interpolating it costs a muddy gradient between two hues where the surface
+// really has an edge, but on the recorded side of that edge the fill cannot
+// know where the edge is either, and a gradient is the honest answer.
+void solveHoleField(Plane& field, const std::vector<uchar>& hole,
+                    int w, int h, bool wrap, bool logDomain)
+{
+    const size_t n = field.v.size();
+    std::vector<uchar> solve(hole);
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<uchar> next(solve);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                if (solve[i] != 0) {
+                    continue;
+                }
+                const int up = wrap ? wrapIndex(y - 1, h) : y - 1;
+                const int dn = wrap ? wrapIndex(y + 1, h) : y + 1;
+                const int lf = wrap ? wrapIndex(x - 1, w) : x - 1;
+                const int rt = wrap ? wrapIndex(x + 1, w) : x + 1;
+                const bool touch =
+                    (up >= 0 && up < h && solve[static_cast<size_t>(up) * w + x] != 0)
+                    || (dn >= 0 && dn < h && solve[static_cast<size_t>(dn) * w + x] != 0)
+                    || (lf >= 0 && lf < w && solve[i - static_cast<size_t>(x) + lf] != 0)
+                    || (rt >= 0 && rt < w && solve[i - static_cast<size_t>(x) + rt] != 0);
+                if (touch) {
+                    next[i] = 1;
+                }
+            }
+        }
+        solve.swap(next);
+    }
+
+    // Luminance is solved in the log domain because light multiplies.
+    // Chromaticity is solved as-is: it is a ratio, not a quantity, and a log
+    // there would bias the interpolation toward the darker side.
+    std::vector<float> value(n);
+    for (size_t i = 0; i < n; ++i) {
+        value[i] = logDomain ? std::log(std::max(field.v[i], 1e-6f)) : field.v[i];
+    }
+
+    // Successive over-relaxation. The region is wider than it is deep, so plain
+    // Gauss-Seidel would need thousands of passes to flatten the middle; the
+    // over-relaxation factor buys roughly an order of magnitude.
+    //
+    // The region is collected and its four neighbours resolved once: sweeping
+    // the whole image 600 times would cost w*h per pass instead of the hole,
+    // which on a 1024 px photo is a 30x waste for no benefit.
+    std::vector<size_t> region;
+    std::vector<int> upOf;
+    std::vector<int> dnOf;
+    std::vector<int> lfOf;
+    std::vector<int> rtOf;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            if (solve[i] == 0) {
+                continue;
+            }
+            const int up = wrap ? wrapIndex(y - 1, h) : y - 1;
+            const int dn = wrap ? wrapIndex(y + 1, h) : y + 1;
+            const int lf = wrap ? wrapIndex(x - 1, w) : x - 1;
+            const int rt = wrap ? wrapIndex(x + 1, w) : x + 1;
+            region.push_back(i);
+            upOf.push_back(up >= 0 && up < h ? static_cast<int>(static_cast<size_t>(up) * w + x) : -1);
+            dnOf.push_back(dn >= 0 && dn < h ? static_cast<int>(static_cast<size_t>(dn) * w + x) : -1);
+            lfOf.push_back(lf >= 0 && lf < w ? static_cast<int>(i - static_cast<size_t>(x) + lf) : -1);
+            rtOf.push_back(rt >= 0 && rt < w ? static_cast<int>(i - static_cast<size_t>(x) + rt) : -1);
+        }
+    }
+
+    // SOR needs a number of passes on the order of the region's diameter: too
+    // few and the middle of the hole keeps the tiled values it started from,
+    // which is the artifact this exists to remove. Tying the count to the
+    // diameter keeps a preview-sized hole proportionally cheap.
+    int minX = w;
+    int maxX = -1;
+    int minY = h;
+    int maxY = -1;
+    for (const size_t i : region) {
+        const int x = static_cast<int>(i % static_cast<size_t>(w));
+        const int y = static_cast<int>(i / static_cast<size_t>(w));
+        minX = std::min(minX, x);
+        maxX = std::max(maxX, x);
+        minY = std::min(minY, y);
+        maxY = std::max(maxY, y);
+    }
+    const int extent = std::max(maxX - minX, maxY - minY) + 1;
+    const int iterations = std::min(900, std::max(120, 3 * extent));
+
+    const double omega = 1.85;
+    const size_t count = region.size();
+    for (int it = 0; it < iterations; ++it) {
+        for (size_t k = 0; k < count; ++k) {
+            double sum = 0.0;
+            int neighbours = 0;
+            if (upOf[k] >= 0) { sum += value[static_cast<size_t>(upOf[k])]; ++neighbours; }
+            if (dnOf[k] >= 0) { sum += value[static_cast<size_t>(dnOf[k])]; ++neighbours; }
+            if (lfOf[k] >= 0) { sum += value[static_cast<size_t>(lfOf[k])]; ++neighbours; }
+            if (rtOf[k] >= 0) { sum += value[static_cast<size_t>(rtOf[k])]; ++neighbours; }
+            if (neighbours == 0) {
+                continue;
+            }
+            float& here = value[region[k]];
+            const double target = sum / neighbours;
+            here = static_cast<float>(here + omega * (target - static_cast<double>(here)));
+        }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (solve[i] != 0) {
+            field.v[i] = logDomain ? std::exp(value[i]) : value[i];
+        }
+    }
+}
+
+// 4-connected labelling of the blown-pixel mask. Returns a label per pixel
+// (-1 where the pixel is known) and the area of every component in label
+// order. Two separate questions need this: how big is the largest hole (which
+// sizes the outward growth) and, per hole, whether the rim around it is one
+// colour or several (which decides whether a filled chromaticity means
+// anything).
+std::vector<int> labelHoles(const std::vector<uchar>& hole, int w, int h, bool wrap,
+                            std::vector<size_t>& areas)
+{
+    const size_t n = hole.size();
+    std::vector<int> label(n, -1);
+    std::vector<size_t> stack;
+    areas.clear();
+    for (size_t seed = 0; seed < n; ++seed) {
+        if (hole[seed] == 0 || label[seed] >= 0) {
+            continue;
+        }
+        const int id = static_cast<int>(areas.size());
+        areas.push_back(0);
+        stack.assign(1, seed);
+        label[seed] = id;
+        while (!stack.empty()) {
+            const size_t p = stack.back();
+            stack.pop_back();
+            ++areas[static_cast<size_t>(id)];
+            const int px = static_cast<int>(p % static_cast<size_t>(w));
+            const int py = static_cast<int>(p / static_cast<size_t>(w));
+            for (int k = 0; k < 4; ++k) {
+                const int nx = px + (k == 0 ? 1 : (k == 1 ? -1 : 0));
+                const int ny = py + (k == 2 ? 1 : (k == 3 ? -1 : 0));
+                if (!wrap && (nx < 0 || ny < 0 || nx >= w || ny >= h)) {
+                    continue;
+                }
+                const size_t q = static_cast<size_t>(wrap ? wrapIndex(ny, h) : ny) * w
+                    + static_cast<size_t>(wrap ? wrapIndex(nx, w) : nx);
+                if (hole[q] != 0 && label[q] < 0) {
+                    label[q] = id;
+                    stack.push_back(q);
+                }
+            }
+        }
+    }
+    return label;
+}
+
 void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, bool wrap)
 {
     const int w = red.w;
@@ -349,6 +530,19 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
     for (size_t i = 0; i < n; ++i) {
         luma.v[i] = static_cast<float>(0.2126 * red.v[i] + 0.7152 * green.v[i] + 0.0722 * blue.v[i]);
     }
+
+    // A blown pixel is one sitting at the image's own ceiling, not one above a
+    // constant. The constant form silently disabled this whole stage on real
+    // input: the seamless pass runs first and its low-frequency blend pulls a
+    // 255 core down to 251, which is linear 0.955 and therefore below 0.985 on
+    // every pixel. Measured on a photograph of tiles, the peak came back 251
+    // and the stage returned before doing anything, leaving the highlight to be
+    // turned into a flat grey disc by the shading division.
+    double ceiling = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        ceiling = std::max(ceiling, static_cast<double>(std::min({red.v[i], green.v[i], blue.v[i]})));
+    }
+    const double clipLevel = std::min(0.985, ceiling - 0.005);
 
     std::vector<uchar> hole(n, 0);
     size_t holes = 0;
@@ -369,10 +563,14 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
         // achromatic surface: a neutral grey texture has zero chroma
         // everywhere, so the whole image became one hole and the shading
         // gradient was flattened.
-        if (std::min({r, g, b}) >= 0.985) {
+        if (std::min({r, g, b}) >= clipLevel) {
             hole[i] = 1;
             ++holes;
         }
+    }
+    if (std::getenv("TG_DELIGHT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "clip: ceiling=%.4f level=%.4f holes=%zu\n", ceiling, clipLevel,
+                     holes);
     }
     if (holes == 0) {
         return;
@@ -410,10 +608,33 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
     // colour always raises it. The error turning over is what says the extra
     // growth is replacing real surface with a copy of the rim. Past the
     // turning point the two disagree, and the error is the one to trust.
+    std::vector<int> label;
+    std::vector<double> consistency;
     {
-        const double holeRadius = std::sqrt(static_cast<double>(holes) / 3.141592653589793);
-        const int grow = std::max(scaledRadius(4, side),
-                                  static_cast<int>(0.35 * holeRadius));
+        // How big is "the hole"? It has to mean one hole, not the sum of all
+        // of them. A single blown lobe is a compact disc, and its specular tail
+        // extends about a third of its radius; a field of small blown specks -
+        // say the near-white patches of a texture clipping under a strong lobe -
+        // can have the same total area while each speck is a few pixels across.
+        // Sizing the growth from the total area gave a 200 px radius on a
+        // 1024 px image and asked for 70 px of growth on every speck, which
+        // swallowed the centre of the picture; the fill then rebuilt it by
+        // copying rim colours inward and the de-lit result scored 11 dB against
+        // a 24 dB input. Taking the largest connected component instead keeps
+        // the lobe case exactly as it was and stops the speck case from
+        // growing past its own neighbours.
+        std::vector<size_t> seedAreas;
+        labelHoles(hole, w, h, wrap, seedAreas);
+        size_t largestHole = 0;
+        for (const size_t area : seedAreas) {
+            largestHole = std::max(largestHole, area);
+        }
+
+        const double holeRadius = std::sqrt(static_cast<double>(largestHole) / 3.141592653589793);
+        // A genuine lobe keeps the absolute floor that sheds its tail; a speck
+        // does not, because four pixels of growth is wider than the speck.
+        const int floorGrowth = holeRadius >= 24.0 ? scaledRadius(4, side) : 1;
+        const int grow = std::max(floorGrowth, static_cast<int>(0.35 * holeRadius));
         Plane mask(w, h);
         for (size_t i = 0; i < n; ++i) {
             mask.v[i] = hole[i] != 0 ? 1.0f : 0.0f;
@@ -424,6 +645,308 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
         for (size_t i = 0; i < n; ++i) {
             hole[i] = grown.v[i] > 0.5f ? 1 : 0;
             holes += hole[i];
+        }
+    }
+
+    // Label again: the growth has merged specks into the regions the fill will
+    // actually see, and it is those regions whose rims matter.
+    std::vector<size_t> areas;
+    label = labelHoles(hole, w, h, wrap, areas);
+    if (std::getenv("TG_DELIGHT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "clip: holes=%zu components=%zu top=", holes, areas.size());
+        size_t top = 0;
+        for (size_t a : areas) top = std::max(top, a);
+        std::fprintf(stderr, "%zu\n", top);
+    }
+
+    // ---- Exemplar offsets -------------------------------------------------
+    //
+    // A nearest-donor fill is radial by construction, and radial is the wrong
+    // shape for a surface that repeats. On a tiled photo the rays cut straight
+    // across the grout, so the repair reads as a smear; on a synthetic
+    // checkerboard it reads as a fan. Both are the same failure, and both go
+    // away if the hole is filled by *translating* an intact part of the image
+    // into it: the pattern continues, because it is the same pattern.
+    //
+    // The offset is found the only way that does not need a model of the
+    // texture: shift the image by a candidate, and score how well its
+    // high-passed luminance matches the high-passed luminance of the intact
+    // ring around the hole. A repeating texture scores high at its period and
+    // low everywhere else, and a photo with nothing repeating scores low
+    // everywhere, which is exactly the case to fall back on the nearest-donor
+    // fill. Measured: 0.86 on a 1024 tile photo at (0, 256), 0.998 on the
+    // checkerboard scene at its 16 px period.
+    //
+    // The high-pass is what makes this work at all. Scoring raw pixels instead
+    // picks whatever offset reproduces the highlight's own glow - the ring is
+    // washed, so a washed piece of image matches it best - and on the tile
+    // photo that returned (188, -108), a shift with no meaning that scored
+    // better than the true 128 px tile period.
+    Plane highPass(w, h);
+    {
+        const Plane wide = boxMean(luma, scaledRadius(8, side), wrap);
+        for (size_t i = 0; i < n; ++i) {
+            highPass.v[i] = luma.v[i] - wide.v[i];
+        }
+    }
+
+    struct Exemplar
+    {
+        int dx = 0;
+        int dy = 0;
+        double score = 0.0;
+        bool valid = false;
+    };
+    std::vector<Exemplar> exemplar(areas.size());
+
+    const int searchRadius = std::max(16, std::min(static_cast<int>(side) / 4, 256));
+    const int coarseStep = std::max(2, searchRadius / 32);
+
+    for (size_t id = 0; id < areas.size(); ++id) {
+        if (areas[id] < 200) {
+            // A speck has no pattern to continue; the donors around it are
+            // already the best available answer.
+            continue;
+        }
+        std::vector<size_t> comp;
+        comp.reserve(areas[id]);
+        Plane only(w, h);
+        for (size_t i = 0; i < n; ++i) {
+            if (label[i] == static_cast<int>(id)) {
+                only.v[i] = 1.0f;
+                comp.push_back(i);
+            }
+        }
+        if (comp.size() < 64) {
+            continue;
+        }
+        // The ring the offset has to agree with: intact pixels just outside the
+        // grown hole. Everything inside the hole is unusable as evidence.
+        const Plane nearRing =
+            extreme1D(extreme1D(only, 5, wrap, true, false), 5, wrap, true, true);
+        std::vector<size_t> ring;
+        for (size_t i = 0; i < n; ++i) {
+            if (nearRing.v[i] > 0.5f && hole[i] == 0) {
+                ring.push_back(i);
+            }
+        }
+        if (ring.size() < 32) {
+            continue;
+        }
+        auto sampleOf = [](const std::vector<size_t>& src) {
+            std::vector<size_t> out;
+            const size_t stride = std::max<size_t>(1, src.size() / 512);
+            for (size_t k = 0; k < src.size(); k += stride) {
+                out.push_back(src[k]);
+            }
+            return out;
+        };
+        const std::vector<size_t> ringSample = sampleOf(ring);
+        const std::vector<size_t> compSample = sampleOf(comp);
+
+        auto shifted = [&](size_t i, int dx, int dy, size_t& out) {
+            const int x = static_cast<int>(i % static_cast<size_t>(w)) + dx;
+            const int y = static_cast<int>(i / static_cast<size_t>(w)) + dy;
+            if (x < 0 || y < 0 || x >= w || y >= h) {
+                return false;
+            }
+            out = static_cast<size_t>(y) * w + static_cast<size_t>(x);
+            return true;
+        };
+        // A usable offset puts the whole hole and the whole ring on recorded
+        // pixels - a fill sourced half from inside another blowout is no fill.
+        auto usable = [&](int dx, int dy) {
+            size_t j = 0;
+            for (const size_t i : compSample) {
+                if (!shifted(i, dx, dy, j) || hole[j] != 0) {
+                    return false;
+                }
+            }
+            for (const size_t i : ringSample) {
+                if (!shifted(i, dx, dy, j) || hole[j] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto scoreOf = [&](int dx, int dy, double& ncc, double& levelGap, double& hueGap) {
+            double a[2] = {0.0, 0.0};
+            double b[2] = {0.0, 0.0};
+            double lumaA = 0.0;
+            double lumaB = 0.0;
+            double hueSum = 0.0;
+            size_t hueCount = 0;
+            size_t count = 0;
+            size_t j = 0;
+            for (const size_t i : ringSample) {
+                if (!shifted(i, dx, dy, j)) {
+                    return false;
+                }
+                const double av = highPass.v[i];
+                const double bv = highPass.v[j];
+                a[0] += av;
+                a[1] += av * av;
+                b[0] += bv;
+                b[1] += bv * bv;
+                lumaA += luma.v[i];
+                lumaB += luma.v[j];
+                // Where does the source sit in colour, against the ring it is
+                // going to be pasted next to? Brightness and saturation both
+                // lie here - the ring is washed by the very highlight being
+                // repaired, so a clean source is always more colourful than the
+                // ring it replaces, and penalising that would reject the good
+                // offsets. Hue survives the wash, so only the hue is compared.
+                const double sumI = static_cast<double>(red.v[i]) + green.v[i] + blue.v[i];
+                const double sumJ = static_cast<double>(red.v[j]) + green.v[j] + blue.v[j];
+                if (sumI > 1e-6 && sumJ > 1e-6) {
+                    const double ir = red.v[i] / sumI;
+                    const double ig = green.v[i] / sumI;
+                    const double ib = blue.v[i] / sumI;
+                    const double jr = red.v[j] / sumJ;
+                    const double jg = green.v[j] / sumJ;
+                    const double jb = blue.v[j] / sumJ;
+                    const double spreadI =
+                        std::max({ir, ig, ib}) - std::min({ir, ig, ib});
+                    const double spreadJ =
+                        std::max({jr, jg, jb}) - std::min({jr, jg, jb});
+                    // A near-neutral pixel has no usable direction.
+                    if (spreadI > 0.03 && spreadJ > 0.03) {
+                        hueSum += 0.5 * (std::abs(ir - jr) + std::abs(ig - jg)
+                                         + std::abs(ib - jb));
+                        ++hueCount;
+                    }
+                }
+                ++count;
+            }
+            if (count < 32) {
+                return false;
+            }
+            const double m = static_cast<double>(count);
+            const double av = a[0] / m;
+            const double bv = b[0] / m;
+            const double varA = std::max(0.0, a[1] / m - av * av);
+            const double varB = std::max(0.0, b[1] / m - bv * bv);
+            const double denom = std::sqrt(varA * varB);
+            if (denom <= 1e-12) {
+                return false;
+            }
+            double cov = 0.0;
+            j = 0;
+            for (const size_t i : ringSample) {
+                shifted(i, dx, dy, j);
+                cov += (highPass.v[i] - av) * (highPass.v[j] - bv);
+            }
+            cov /= m;
+            ncc = cov / denom;
+            levelGap = std::abs(lumaA - lumaB) / m;
+            // Only meaningful when enough of the ring carries a hue at all;
+            // otherwise the term is a measure of noise.
+            hueGap = hueCount * 4 >= count
+                ? hueSum / static_cast<double>(hueCount)
+                : 0.0;
+            return true;
+        };
+
+        struct Candidate
+        {
+            double scored = -2.0;
+            double ncc = 0.0;
+            double gap = 0.0;
+            double hue = 0.0;
+            int dx = 0;
+            int dy = 0;
+        };
+        std::vector<Candidate> candidates;
+
+        auto consider = [&](int dx, int dy) {
+            if (std::abs(dx) < 4 && std::abs(dy) < 4) {
+                return;
+            }
+            if (!usable(dx, dy)) {
+                return;
+            }
+            Candidate c;
+            c.dx = dx;
+            c.dy = dy;
+            if (!scoreOf(dx, dy, c.ncc, c.gap, c.hue)) {
+                return;
+            }
+            // Hue only. Brightness and saturation are both *changed by the
+            // very highlight being repaired*: the ring is washed, so it is
+            // brighter and paler than the surface underneath, and a clean
+            // source can never match it. Penalising that mismatch does not
+            // find the surface, it finds another washed patch - measured on
+            // the tile photo it chose (189, 0), which pasted a magenta tile
+            // into an olive corner, over (0, 256), which is the tile period
+            // and lines the grout up. Hue survives the wash, so hue is what
+            // is compared.
+            c.scored = c.ncc - 1.5 * c.hue;
+            candidates.push_back(c);
+        };
+        // Ties are broken towards the shortest shift: a translation drags a
+        // whole neighbourhood with it, so the longer it is the less the
+        // surroundings have in common with the hole. Scores within 0.02 count
+        // as tied - they all answer "the pattern repeats", which is the only
+        // question this search can answer.
+        auto bestOf = [](const std::vector<Candidate>& pool) {
+            Candidate best;
+            bool have = false;
+            for (const Candidate& c : pool) {
+                if (!have) {
+                    best = c;
+                    have = true;
+                    continue;
+                }
+                const int magnitude = std::abs(c.dx) + std::abs(c.dy);
+                const int bestMagnitude = std::abs(best.dx) + std::abs(best.dy);
+                if (c.scored > best.scored + 0.02
+                    || (c.scored > best.scored - 0.02 && magnitude < bestMagnitude)) {
+                    best = c;
+                }
+            }
+            return best;
+        };
+
+        for (int dy = -searchRadius; dy <= searchRadius; dy += coarseStep) {
+            for (int dx = -searchRadius; dx <= searchRadius; dx += coarseStep) {
+                consider(dx, dy);
+            }
+        }
+        if (candidates.empty()) {
+            continue;
+        }
+        Candidate best = bestOf(candidates);
+        // Refine at pixel resolution around the coarse winner.
+        if (coarseStep > 1) {
+            for (int dy = best.dy - coarseStep; dy <= best.dy + coarseStep; ++dy) {
+                for (int dx = best.dx - coarseStep; dx <= best.dx + coarseStep; ++dx) {
+                    consider(dx, dy);
+                }
+            }
+            best = bestOf(candidates);
+        }
+        // Below this the image is not repeating and the translation would be a
+        // clone stamp of some unrelated surface.
+        if (best.scored >= 0.55) {
+            Exemplar chosen;
+            chosen.dx = best.dx;
+            chosen.dy = best.dy;
+            chosen.score = best.ncc;
+            chosen.valid = true;
+            exemplar[id] = chosen;
+        }
+        if (std::getenv("TG_DELIGHT_DEBUG") != nullptr) {
+            std::vector<Candidate> top(candidates);
+            std::sort(top.begin(), top.end(), [](const Candidate& a, const Candidate& b) {
+                return a.scored > b.scored;
+            });
+            const size_t show = std::min<size_t>(3, top.size());
+            std::fprintf(stderr, "clip: exemplar id=%zu area=%zu", id, areas[id]);
+            for (size_t k = 0; k < show; ++k) {
+                std::fprintf(stderr, "  [(%d,%d) ncc=%.3f hue=%.3f s=%.3f]", top[k].dx, top[k].dy,
+                             top[k].ncc, top[k].hue, top[k].scored);
+            }
+            std::fprintf(stderr, "  %s\n", best.scored >= 0.55 ? "used" : "rejected");
         }
     }
 
@@ -465,6 +988,89 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
         done[i] = 1;
     }
 
+    // Translation fill, where the image repeats (see the offset search above).
+    std::vector<uchar> fromExemplar(areas.size(), 0);
+    for (size_t id = 0; id < exemplar.size(); ++id) {
+        if (!exemplar[id].valid) {
+            continue;
+        }
+        fromExemplar[id] = 1;
+        for (size_t i = 0; i < n; ++i) {
+            if (hole[i] == 0 || label[i] != static_cast<int>(id)) {
+                continue;
+            }
+            const int x = static_cast<int>(i % static_cast<size_t>(w)) + exemplar[id].dx;
+            const int y = static_cast<int>(i / static_cast<size_t>(w)) + exemplar[id].dy;
+            if (x < 0 || y < 0 || x >= w || y >= h) {
+                continue;
+            }
+            const size_t j = static_cast<size_t>(y) * w + static_cast<size_t>(x);
+            if (hole[j] != 0 || done[j] == 0) {
+                continue;
+            }
+            chromaR.v[i] = chromaR.v[j];
+            chromaG.v[i] = chromaG.v[j];
+            chromaB.v[i] = chromaB.v[j];
+            fillLuma.v[i] = fillLuma.v[j];
+            done[i] = 1;
+        }
+    }
+
+    // A translated patch carries the *lighting* of where it came from, and the
+    // ring around the hole carries the lighting of where it lands. When those
+    // differ by a smooth amount - the bloom veil around a blowout is exactly
+    // that - the copy lands as a darker blob with a hard edge, which is worse
+    // than the flat disc it was meant to replace: on the user's tile photo the
+    // patch came back at luma 121 against 138 on the ring twenty pixels away.
+    // Level-match it in the gradient domain (Poisson): keep the patch's detail,
+    // and solve for the offset field that makes its level meet the ring. The
+    // boundary term is a log ratio because the patch is scaled by it.
+    for (size_t id = 0; id < exemplar.size(); ++id) {
+        if (!exemplar[id].valid) {
+            continue;
+        }
+        const int dx = exemplar[id].dx;
+        const int dy = exemplar[id].dy;
+        std::vector<uchar> comp(n, 0);
+        bool any = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (hole[i] != 0 && label[i] == static_cast<int>(id)) {
+                comp[i] = 1;
+                any = true;
+            }
+        }
+        if (!any) {
+            continue;
+        }
+        auto logLumaAt = [&](size_t i) {
+            return std::log(std::max(static_cast<double>(luma.v[i]), 1e-4));
+        };
+        Plane bias(w, h);
+        for (size_t i = 0; i < n; ++i) {
+            if (hole[i] != 0) {
+                continue;
+            }
+            const int x = static_cast<int>(i % static_cast<size_t>(w)) + dx;
+            const int y = static_cast<int>(i / static_cast<size_t>(w)) + dy;
+            if (x < 0 || y < 0 || x >= w || y >= h) {
+                continue;
+            }
+            const size_t j = static_cast<size_t>(y) * w + static_cast<size_t>(x);
+            if (hole[j] != 0) {
+                continue;
+            }
+            bias.v[i] = static_cast<float>(logLumaAt(i) - logLumaAt(j));
+        }
+        solveHoleField(bias, comp, w, h, wrap, false);
+        for (size_t i = 0; i < n; ++i) {
+            if (comp[i] == 0) {
+                continue;
+            }
+            fillLuma.v[i] = static_cast<float>(
+                static_cast<double>(fillLuma.v[i]) * std::exp(static_cast<double>(bias.v[i])));
+        }
+    }
+
     // Breadth-first from the rim inward. Two properties of this order are what
     // make the fill work: a pixel is enqueued by the first neighbour to reach
     // it, and because the queue is processed in distance order that neighbour
@@ -473,7 +1079,7 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
     std::vector<size_t> queue;
     queue.reserve(holes);
     for (size_t i = 0; i < n; ++i) {
-        if (hole[i] == 0) {
+        if (hole[i] == 0 || done[i] != 0) {
             continue;
         }
         for (int k = 0; k < 4; ++k) {
@@ -499,11 +1105,132 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
         done[i] = 1;
         for (int k = 0; k < 4; ++k) {
             size_t j = 0;
-            if (neighbour(i, k, j) && hole[j] != 0 && queued[j] == 0) {
+            if (neighbour(i, k, j) && hole[j] != 0 && queued[j] == 0 && done[j] == 0) {
                 queued[j] = 1;
                 from[j] = static_cast<int>(i);
                 queue.push_back(j);
             }
+        }
+    }
+
+    // How much of the filled colour does the rim actually support?
+    //
+    // The fill is a nearest-donor copy, so it is a continuation only when the
+    // donors around a hole agree. That is exactly the property worth measuring:
+    // walk the hole and count how often two neighbouring filled pixels ended up
+    // with donors of different hue. A highlight over a surface - even one that
+    // straddles two surfaces, warm on one side and cool on the other - has one
+    // seam between donor regions and agrees everywhere else. A small blown
+    // patch whose neighbours are red, green and blue has no interior at all,
+    // only seams: the copy then tiles three hues into an eight-pixel square
+    // and the Laplace solve blends them into (147,111,149) where the sensor's
+    // own near-white reading was off by 23 levels a channel instead of 85.
+    //
+    // The disagreement is a fraction, so no absolute threshold on colour is
+    // needed here - only a scale for "these two donors are different colours",
+    // which is the same kind of number the rest of this pass already compares.
+    consistency.assign(areas.size(), 1.0);
+    if (!areas.empty()) {
+        std::vector<size_t> pairs(areas.size(), 0);
+        std::vector<size_t> clashes(areas.size(), 0);
+        for (size_t i = 0; i < n; ++i) {
+            if (hole[i] == 0 || label[i] < 0 || done[i] == 0) {
+                continue;
+            }
+            const size_t id = static_cast<size_t>(label[i]);
+            if (id >= areas.size()) {
+                continue;
+            }
+            for (int k = 0; k < 4; ++k) {
+                size_t j = 0;
+                if (!neighbour(i, k, j) || hole[j] == 0 || label[j] != label[i]) {
+                    continue;
+                }
+                ++pairs[id];
+                const double dr = std::abs(chromaR.v[i] - chromaR.v[j]);
+                const double dg = std::abs(chromaG.v[i] - chromaG.v[j]);
+                const double db = std::abs(chromaB.v[i] - chromaB.v[j]);
+                if (std::max({dr, dg, db}) > 0.08) {
+                    ++clashes[id];
+                }
+            }
+        }
+        for (size_t id = 0; id < areas.size(); ++id) {
+            // Size decides first. A hole with an interior - the blown core of a
+            // real highlight, a hundred pixels across - has room for each
+            // surface around it to extend into, and the different hues then
+            // meet along a few seams the way they do outside the hole. Only a
+            // hole of a few pixels, with no interior at all, is the case where
+            // extending turns into a confetti of several hues, and where the
+            // recording is the better answer.
+            if (areas[id] >= 200 || pairs[id] < 8) {
+                continue;
+            }
+            const double clashRate = static_cast<double>(clashes[id]) / static_cast<double>(pairs[id]);
+            // Both ends of the scale are measured on the test scenes rather
+            // than picked: a highlight straddling warm and cool surfaces
+            // clashes on 0.005 of its neighbouring pairs - one seam, which is
+            // what a fill across two surfaces is supposed to produce - and a
+            // blown white tile ringed by three hues clashes on 0.12 of them.
+            // The first 0.02 is therefore a dead zone rather than evidence,
+            // and the scale is spent between 0.02 and 0.12.
+            const double clashExcess = std::max(0.0, clashRate - 0.02);
+            consistency[id] = saturate(1.0 - clashExcess / 0.10);
+        }
+    }
+
+    // The copied fields are the starting point, not the answer. A copy puts a
+    // straight cliff wherever two donors' cells meet, and both fields show it
+    // as a faceted wedge: luminance as a brightness step, chromaticity as a
+    // hue step (the pale triangle the user circled). Both are solved for
+    // instead, with the surrounding rim as the boundary condition, so the
+    // filled area is the smoothest field consistent with what was recorded.
+    // Only the small holes are smoothed. A few-pixel hole has no interior to
+    // keep, and the seams where its donors meet are the entire artifact, so the
+    // harmonic field is exactly right there. A large hole is the opposite case:
+    // its interior is a surface, and flattening it to the harmonic field is
+    // what turns the repair into a flat grey disc. Measured on a 1024 px tile
+    // photo, a 70 px blown core grown by 35 px came back at chroma 0.05 against
+    // 0.22 on the surrounding mosaic when the whole hole was solved, and kept
+    // the mosaic's own patches when it was not. The 200 px cutoff is the same
+    // one the consistency rule above uses for "this hole has an interior".
+    std::vector<uchar> small(hole.size(), 0);
+    bool anySmall = false;
+    for (size_t i = 0; i < n; ++i) {
+        if (hole[i] == 0 || label[i] < 0) {
+            continue;
+        }
+        const size_t id = static_cast<size_t>(label[i]);
+        if (id >= areas.size() || fromExemplar[id] != 0) {
+            continue;
+        }
+        small[i] = 1;
+        anySmall = true;
+    }
+    if (anySmall) {
+        solveHoleField(fillLuma, small, w, h, wrap, true);
+        solveHoleField(chromaR, small, w, h, wrap, false);
+        solveHoleField(chromaG, small, w, h, wrap, false);
+        solveHoleField(chromaB, small, w, h, wrap, false);
+    }
+    if (holes > 0) {
+        // Laplace is linear, so a boundary that sums to one everywhere keeps
+        // summing to one; renormalising only absorbs the residual of an
+        // early-stopped SOR sweep.
+        for (size_t i = 0; i < n; ++i) {
+            if (hole[i] == 0) {
+                continue;
+            }
+            const double sum = static_cast<double>(chromaR.v[i]) + chromaG.v[i] + chromaB.v[i];
+            if (sum <= 1e-6) {
+                chromaR.v[i] = 1.0f / 3.0f;
+                chromaG.v[i] = 1.0f / 3.0f;
+                chromaB.v[i] = 1.0f / 3.0f;
+                continue;
+            }
+            chromaR.v[i] = static_cast<float>(chromaR.v[i] / sum);
+            chromaG.v[i] = static_cast<float>(chromaG.v[i] / sum);
+            chromaB.v[i] = static_cast<float>(chromaB.v[i] / sum);
         }
     }
 
@@ -522,9 +1249,21 @@ void rebuildClippedHighlights(Plane& red, Plane& green, Plane& blue, int side, b
         // Scale the chromaticity so the rebuilt pixel carries the luminance of
         // the surrounding surface rather than the luminance of the blowout.
         const double total = static_cast<double>(fillLuma.v[i]) / asLuma;
-        red.v[i] = static_cast<float>(cr * total);
-        green.v[i] = static_cast<float>(cg * total);
-        blue.v[i] = static_cast<float>(cb * total);
+        // How far to trust the reconstruction at all. When the whole rim is one
+        // surface the fill is a continuation and is used in full. When the rim
+        // disagrees - a blown patch whose neighbours are red, green and blue -
+        // there is no surface to continue, and the blend of the rim hues is a
+        // colour that is on nothing: on the coloured test scene a white patch
+        // came back (147,111,149) where simply leaving the sensor's own
+        // near-white reading would have been off by 23 levels a channel
+        // instead of 85. Keeping the reading is the honest failure mode; only
+        // the part of the fill the rim actually supports is applied.
+        const double agree = (label[i] >= 0 && static_cast<size_t>(label[i]) < consistency.size())
+            ? consistency[static_cast<size_t>(label[i])]
+            : 1.0;
+        red.v[i] = static_cast<float>(red.v[i] + (cr * total - red.v[i]) * agree);
+        green.v[i] = static_cast<float>(green.v[i] + (cg * total - green.v[i]) * agree);
+        blue.v[i] = static_cast<float>(blue.v[i] + (cb * total - blue.v[i]) * agree);
     }
 }
 
@@ -554,7 +1293,15 @@ void removeSpecular(Plane& red, Plane& green, Plane& blue, int side, bool wrap, 
         // A pixel far brighter than its neighbourhood is a specular lobe. A
         // broad bright region has base ~= luma and leaves the mask at zero.
         const double baseL = std::max(static_cast<double>(base.v[i]), 1e-4);
-        const double mask = saturate((luma.v[i] - baseL) / baseL * 2.0) * amount;
+        const double excess = std::max(0.0, static_cast<double>(luma.v[i]) - baseL);
+        // A highlight is a *clear* excess, not any excess. A surface 18% above
+        // its neighbourhood mean is ordinary texture - bright albedo next to
+        // darker albedo - and rewriting it costs real colour: a green tile at
+        // that level came back as (12,162,24) for an albedo of (26,184,36),
+        // visibly more saturated than the material. Requiring half again over
+        // the base before the rewrite starts keeps that tile intact and still
+        // saturates on a genuine lobe.
+        const double mask = saturate((excess / baseL - 0.5) * 2.0) * amount;
 
         double tR = r;
         double tG = g;
@@ -565,11 +1312,44 @@ void removeSpecular(Plane& red, Plane& green, Plane& blue, int side, bool wrap, 
             const double sfG = g - m;
             const double sfB = b - m;
             const double sfSum = sfR + sfG + sfB;
-            if (sfSum > 1e-5) {
-                const double intensity = 3.0 * baseL;
-                tR = sfR / sfSum * intensity;
-                tG = sfG / sfSum * intensity;
-                tB = sfB / sfSum * intensity;
+            // The specular-free image is I - min(R,G,B). Its whole job is to
+            // cancel an achromatic addition and keep a *chromaticity*, so the
+            // rewrite below is only meaningful when this pixel has one left.
+            //
+            // The failure this guards against is amplification, not a wrong
+            // classification. On a slightly warm white (0.90, 0.88, 0.84 in
+            // sRGB) the three differences are 0.115, 0.076 and 0; normalising
+            // them is a gain of about 5x and hands back a fully saturated
+            // orange. There is no threshold on that number that separates a
+            // tinted white surface from a washed-out highlight - the two are
+            // the same measurement - so instead the estimate fades in with its
+            // own reliability. A red or green surface measures 0.6-0.8 here
+            // and is rewritten outright; a white one measures 0.09 and keeps
+            // its colour, which is the right answer: an achromatic surface
+            // under an achromatic highlight has no hue to recover, and the
+            // brightness is the shading stage's job.
+            const double spread = sfSum / std::max(r + g + b, 1e-6);
+            const double reliability = saturate((spread - 0.10) / 0.20);
+            if (reliability > 0.0) {
+                // Relight the surface colour with the *diffuse* intensity, not
+                // with the neighbourhood's. The specular component is what
+                // lifts this pixel above the local base, so removing it means
+                // subtracting that excess from the pixel's own energy. Using
+                // the base directly instead - as this used to - makes every
+                // surface that is legitimately brighter than its surroundings
+                // look like a highlight and repaints it by the neighbourhood's
+                // brightness: a green tile 37% above the local mean came back
+                // 1.7x too bright.
+                const double intensity =
+                    std::max(0.0, (r + g + b) - 3.0 * excess);
+                const double weight = reliability * mask;
+                tR = r + (sfR / sfSum * intensity - r) * weight;
+                tG = g + (sfG / sfSum * intensity - g) * weight;
+                tB = b + (sfB / sfSum * intensity - b) * weight;
+                outR.v[i] = static_cast<float>(tR);
+                outG.v[i] = static_cast<float>(tG);
+                outB.v[i] = static_cast<float>(tB);
+                continue;
             }
         }
         outR.v[i] = static_cast<float>(r + (tR - r) * mask);
@@ -702,7 +1482,12 @@ void removeShading(Plane& red,
 }
 } // namespace
 
-QImage LightingRemoval::remove(const QImage& image, const QImage& depth, double strength, bool wrap)
+namespace
+{
+// Shared body of both public entry points. `clipOnly` is what
+// restoreClippedHighlights() uses to run the first stage alone, on the
+// photograph and before any tiling has touched it.
+QImage runStages(const QImage& image, const QImage& depth, double strength, bool wrap, bool clipOnly)
 {
     // Byte-exact passthrough at the left end of the slider. The round trip
     // through linear light would otherwise introduce +/-1 rounding, and the
@@ -740,10 +1525,23 @@ QImage LightingRemoval::remove(const QImage& image, const QImage& depth, double 
     }
 
     const int side = std::max(w, h);
-    rebuildClippedHighlights(red, green, blue, side, wrap);
-    removeSpecular(red, green, blue, side, wrap, amount);
-    correctIlluminant(red, green, blue, amount);
-    removeShading(red, green, blue, depth, side, wrap, amount);
+    // TG_DELIGHT_SKIP=csi h isolates a stage for diagnosis: the letters are
+    // clipped highlights, specular, illuminant and shading. It is how the
+    // regression on coloured albedo was traced to the first two stages rather
+    // than to the shading estimate everyone suspected. Unset in normal runs.
+    const QByteArray skipStages = qgetenv("TG_DELIGHT_SKIP");
+    if (!skipStages.contains('c')) {
+        rebuildClippedHighlights(red, green, blue, side, wrap);
+    }
+    if (!clipOnly && !skipStages.contains('s')) {
+        removeSpecular(red, green, blue, side, wrap, amount);
+    }
+    if (!clipOnly && !skipStages.contains('i')) {
+        correctIlluminant(red, green, blue, amount);
+    }
+    if (!clipOnly && !skipStages.contains('h')) {
+        removeShading(red, green, blue, depth, side, wrap, amount);
+    }
 
     QImage output(w, h, QImage::Format_ARGB32_Premultiplied);
     for (int y = 0; y < h; ++y) {
@@ -759,6 +1557,19 @@ QImage LightingRemoval::remove(const QImage& image, const QImage& depth, double 
         }
     }
     return output;
+}
+} // namespace
+
+QImage LightingRemoval::remove(const QImage& image, const QImage& depth, double strength, bool wrap)
+{
+    return runStages(image, depth, strength, wrap, false);
+}
+
+QImage LightingRemoval::restoreClippedHighlights(const QImage& image)
+{
+    // Strength is fixed at 1: this stage has no slider, and a partial rebuild
+    // would leave a highlight that is neither clipped nor recovered.
+    return runStages(image, QImage(), 1.0, false, true);
 }
 
 int LightingRemoval::tableErrorLevels()

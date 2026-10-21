@@ -175,11 +175,16 @@ void appendQuad(QVector<PreviewVertex>& vertices,
         origin + uAxis + vAxis,
         origin + vAxis,
     };
+    // v = 0 on the *top* edge, matching the sphere (whose v=0 is the north
+    // pole). makeTexture does not mirror, so v=1 is the image's bottom rows -
+    // writing v=0 at the bottom here turned the whole map upside down on the
+    // cube while the sphere showed it the right way up (measured: a
+    // top-red/bottom-blue map came out blue on top, R-B -121 against +115).
     const QVector2D uvs[4] = {
-        QVector2D(0.0f, 0.0f),
-        QVector2D(1.0f, 0.0f),
-        QVector2D(1.0f, 1.0f),
         QVector2D(0.0f, 1.0f),
+        QVector2D(1.0f, 1.0f),
+        QVector2D(1.0f, 0.0f),
+        QVector2D(0.0f, 0.0f),
     };
     for (int corner = 0; corner < 4; ++corner) {
         vertices.push_back({
@@ -281,7 +286,7 @@ uniform int uHasRoughness;
 uniform int uHasMetal;
 uniform int uHasAo;
 uniform int uHasAlpha;
-uniform int uViewMode; // 0 = full, 1 = normal only, 2 = bump only
+uniform int uViewMode; // 0 = full, 1 = the normal map's own colours, 2 = bump only
 uniform vec2 uBumpTexel;
 uniform vec3 uLightDir;
 uniform vec3 uFillDir;
@@ -323,33 +328,29 @@ vec3 sampleSurfaceNormal()
     vec3 N = normalize(vNormal);
     mat3 TBN = mat3(normalize(vTangent), normalize(vBitangent), N);
 
-    // Isolate a single channel: normal-only and bump-only ignore every other
-    // map and pick their own source, so the user can judge each one's actual
-    // contribution before looking at the full stack.
-    if (uViewMode == 1) {
-        if (uHasNormal == 1) {
-            vec3 tangentNormal = texture(uNormalTex, vUv).xyz * 2.0 - 1.0;
-            tangentNormal.y = -tangentNormal.y;
-            return normalize(TBN * tangentNormal);
-        }
-        return N;
-    }
-
+    // Bump-only ignores every other map and derives its normal from the height
+    // map, so the user can judge that one contribution on its own. (The normal
+    // mode does not come through here: it shows the map's pixels directly.)
     if (uViewMode == 2) {
         if (uHasBump == 1) {
             float hL = texture(uBumpTex, vUv - vec2(uBumpTexel.x, 0.0)).r;
             float hR = texture(uBumpTex, vUv + vec2(uBumpTexel.x, 0.0)).r;
             float hU = texture(uBumpTex, vUv - vec2(0.0, uBumpTexel.y)).r;
             float hD = texture(uBumpTex, vUv + vec2(0.0, uBumpTexel.y)).r;
-            vec3 bumpNormal = normalize(vec3((hL - hR) * 2.6, (hU - hD) * 2.6, 1.0));
+            vec3 bumpNormal = normalize(vec3((hL - hR) * 2.6, (hD - hU) * 2.6, 1.0));
             return normalize(TBN * bumpNormal);
         }
         return N;
     }
 
     if (uHasNormal == 1) {
+        // Used as stored. makeTexture does not mirror and both shapes put v=0
+        // on the image's top row, so the texture's +v runs *down* while the
+        // frame's bitangent runs up - the green channel already carries the
+        // right sign for that frame (green bright = the normal leans up), and
+        // flipping it here made the map disagree with the height-map path and
+        // with Blender.
         vec3 tangentNormal = texture(uNormalTex, vUv).xyz * 2.0 - 1.0;
-        tangentNormal.y = -tangentNormal.y;
         return normalize(TBN * tangentNormal);
     }
 
@@ -358,7 +359,11 @@ vec3 sampleSurfaceNormal()
         float hR = texture(uBumpTex, vUv + vec2(uBumpTexel.x, 0.0)).r;
         float hU = texture(uBumpTex, vUv - vec2(0.0, uBumpTexel.y)).r;
         float hD = texture(uBumpTex, vUv + vec2(0.0, uBumpTexel.y)).r;
-        vec3 bumpNormal = normalize(vec3((hL - hR) * 2.6, (hU - hD) * 2.6, 1.0));
+        // n = (-dh/du, -dh/dv) with v up the image. v runs down, so "up" is
+        // hU, and the y term is (hD - hU) - not the (hU - hD) that mirrors the
+        // x term. With (hU - hD) the relief came out vertically inverted,
+        // opposite to what the normal map of the same height shows.
+        vec3 bumpNormal = normalize(vec3((hL - hR) * 2.6, (hD - hU) * 2.6, 1.0));
         return normalize(TBN * bumpNormal);
     }
 
@@ -367,15 +372,31 @@ vec3 sampleSurfaceNormal()
 
 void main()
 {
+    // The normal map's own colours, shown as stored - no lighting, no albedo.
+    // This is the view a texture artist expects from CrazyBump/Photoshop, where
+    // the map reads as the familiar lavender/blue sheet, and it is what "Normal
+    // Only" now means. (There used to be a second entry that lit a neutral
+    // surface with the normals; it answered a question nobody asked twice, and
+    // having two normal entries made the list harder to read than the maps it
+    // previews.)
+    if (uViewMode == 1) {
+        if (uHasNormal == 1) {
+            fragColor = vec4(texture(uNormalTex, vUv).rgb, 1.0);
+        } else {
+            fragColor = vec4(0.5, 0.5, 1.0, 1.0);
+        }
+        return;
+    }
+
     vec3 albedo = uHasBase == 1 ? pow(texture(uBaseTex, vUv).rgb, vec3(2.2)) : vec3(0.72, 0.74, 0.78);
     float roughness = uHasRoughness == 1 ? texture(uRoughnessTex, vUv).r : 0.48;
     float metalness = uHasMetal == 1 ? texture(uMetalTex, vUv).r : 0.0;
     float ao = uHasAo == 1 ? texture(uAoTex, vUv).r : 1.0;
     float alpha = uHasAlpha == 1 ? texture(uAlphaTex, vUv).r : 1.0;
 
-    // Channel-isolation views use a neutral matte surface so the shape/lighting
-    // the map produces is the only thing being judged.
-    if (uViewMode == 1 || uViewMode == 2) {
+    // The bump-only view uses a neutral matte surface so the shape the height
+    // map produces is the only thing being judged.
+    if (uViewMode == 2) {
         albedo = vec3(0.72, 0.74, 0.78);
         roughness = 0.55;
         metalness = 0.0;
@@ -683,8 +704,16 @@ void MaterialPreviewWidget::paintGL()
 
     // Fixed studio key light (upper-left-front) + cool fill. The light stays
     // put so the material's look under rotation is constant and predictable.
-    const QVector3D lightDir(0.52f, -0.38f, 0.82f);
-    const QVector3D fillDir(-0.42f, 0.35f, 0.74f);
+    // These are directions *toward* each light, and the shader uses them that
+    // way (dot(N, L), half vector V+L). The key was written as (0.52, -0.38,
+    // 0.82): -Y means below, so the "upper-left key" the comment above always
+    // claimed was really lighting the model from the lower right - measured on
+    // a plain sphere, the bottom came out 9 luma brighter than the top, and a
+    // raised bump caught the light on its underside. Both signs are flipped
+    // back here; the fill moves to the opposite side so it fills rather than
+    // duplicating the key.
+    const QVector3D lightDir(-0.52f, 0.38f, 0.82f);
+    const QVector3D fillDir(0.42f, 0.30f, 0.74f);
     const QImage bump = m_images.value(QStringLiteral("bump"));
     const QVector2D bumpTexel(bump.isNull() ? 1.0f / 1024.0f : 1.0f / std::max(1, bump.width()),
                               bump.isNull() ? 1.0f / 1024.0f : 1.0f / std::max(1, bump.height()));

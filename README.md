@@ -21,8 +21,9 @@ texture-generator/
 │   ├── Launch-Texture-Generator.bat
 │   ├── models/                #   Depth Anything V2 Small (ONNX) + its licence
 │   ├── third_party/onnxruntime/  # ONNX Runtime (MIT), loaded at run time
+│   ├── tools/                 #   Real-ESRGAN upscaler (fetched, not committed)
 │   ├── _get_depth_model.ps1   #   downloads the model + runtime (~61 MB)
-│   └── _get_realesrgan.ps1    #   optional Real-ESRGAN upscaler downloader
+│   └── _get_realesrgan.ps1    #   downloads the Real-ESRGAN upscaler (~45 MB)
 ├── extension/                 # TG Blender Link — official Blender extension
 │   ├── blender_manifest.toml  #   extension metadata (id, version, support)
 │   ├── __init__.py            #   socket server + material builder
@@ -90,8 +91,8 @@ Download `TextureGeneratorQt-portable.zip` from the
 [Releases](https://github.com/skulunna-blip/texture-generator/releases) page. It
 runs on any 64-bit Windows PC with no install — unzip and double-click
 `TextureGeneratorQt.exe`. Blender must be installed for the Blender-link
-feature; Real-ESRGAN (for upscaling) is optional, see `tools/README.txt` inside
-the zip.
+feature. The upscaler (Real-ESRGAN) is included, so every feature works offline
+straight out of the zip — nothing else to download.
 
 To build the package yourself, run `_pack_portable.ps1` after building; it
 writes the zip into `dist/`. The zip is not tracked in git — it is a build
@@ -103,11 +104,15 @@ artifact that changes every release.
 |---|---|---|---|
 | [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) (Small) | v2 | Apache-2.0 | Monocular depth for the AI height/normal/AO path |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | 1.20.1 | MIT | Runs the depth model; loaded at run time via `QLibrary` |
-| [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (ncnn-vulkan) | v0.2.5.0 | BSD-3-Clause | Optional upscaler, downloaded separately by the user |
+| [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (ncnn-vulkan) | v0.2.5.0 | BSD-3-Clause | Upscaler (x4plus / x4plus-anime), bundled so it works offline |
 
-Licence texts ship with the distribution: `app/models/LICENSE-DepthAnythingV2-Apache-2.0.txt`
-and `app/third_party/onnxruntime/LICENSE` (both copied into the portable package
-as well). All three are compatible with this project's GPL-3.0-or-later.
+Licence texts ship with the distribution: `app/models/LICENSE-DepthAnythingV2-Apache-2.0.txt`,
+`app/third_party/onnxruntime/LICENSE` and
+`app/tools/LICENSE-RealESRGAN-BSD-3-Clause.txt` (all copied into the portable
+package as well). All three are compatible with this project's GPL-3.0-or-later.
+
+The Real-ESRGAN binaries and weights are fetched by `app/_get_realesrgan.ps1`
+rather than committed, because the two models alone are 42 MB.
 
 > Only the **Small** Depth Anything checkpoint may be redistributed here.
 > Upstream licenses Small under Apache-2.0 but licenses Base, Large and Giant

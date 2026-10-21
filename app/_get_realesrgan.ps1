@@ -20,15 +20,30 @@ if (Test-Path (Join-Path $extractDir "realesrgan-ncnn-vulkan.exe")) {
     exit 0
 }
 
+function Test-Downloaded {
+    return (Test-Path $zip) -and ((Get-Item $zip).Length -gt 1MB)
+}
+
 $done = $false
 foreach ($u in $urls) {
+    # curl.exe is the fast path, but it ignores the Windows proxy settings that
+    # Invoke-WebRequest picks up, so a machine behind a proxy fails here and
+    # succeeds there. Try both before moving on to the next mirror.
     try {
-        Write-Host "Downloading $u"
+        Write-Host "Downloading $u (curl)"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
         curl.exe -L --fail --connect-timeout 15 -o $zip $u
-        if ((Test-Path $zip) -and ((Get-Item $zip).Length -gt 1MB)) {
-            $done = $true
-            break
-        }
+        if (Test-Downloaded) { $done = $true; break }
+    }
+    catch {
+        Write-Host "  curl failed"
+    }
+
+    try {
+        Write-Host "  retrying with Invoke-WebRequest"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing -TimeoutSec 120
+        if (Test-Downloaded) { $done = $true; break }
     }
     catch {
         Write-Host "  failed, trying next mirror"

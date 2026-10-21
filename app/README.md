@@ -6,8 +6,8 @@ Desktop texture generator in `C++ + Qt Widgets`.
 
 - 深色工具风格界面，中/英双语切换
 - 1K / 2K / 4K 输出
-- 可选 1:1 裁剪
-- 可选无缝边缘（offset-blend + wrap-aware 派生图）
+- 可选 1:1（居中裁切 / 拉伸，拉伸对应 Bitmap2Material 的做法）
+- 可选无缝边缘（逐轴半偏移 + 图割选缝 + 拉普拉斯金字塔多频段融合；派生图同样 wrap-aware）
 - 生成 `base color`、`bump`、`normal`、`metal`、`roughness`、`AO`、`alpha`
 - 可调 `bump` / `normal` 强度，实时低分辨率预览
 - **材质分解引擎**：
@@ -38,7 +38,15 @@ cmake --build build
 
 | 目标 | 验证内容 |
 |------|----------|
-| `tg_seam_check` | 无缝管线：边缘差收敛（offset-blend 后边界一致） |
+| `tg_seam_check` | 无缝管线：六张贴图的边缘差都收敛到内部水平 |
+| `tg_seam_cut` | 选缝用的最小割（逐图对拍暴力枚举）+ 每轴 mask 形状 |
+| `tg_seam_visual` | 不是断言：把某张图的无缝结果平铺 3×3 写成 PNG，用眼睛看 |
+| `tg_square_test` | 1:1 裁切/拉伸到底谁保留整图 |
+| `tg_delight_check` | 去光影：强度 0 逐字节直通、合成场景还原度、alpha 保全 |
+| `tg_neural_check` | 端到端：去光影 + 深度神经路径，选项关闭时逐字节等于旧管线 |
+| `tg_depth_check` | 单目深度推理，模型缺失时 SKIP 而不是假通过 |
+| `tg_height_precision` | 高度管线：8 位中间模糊造成的法线量化误差 |
+| `tg_preview_timing` | 不是断言：打印实时预览各配置的冷/热耗时 |
 | `tg_style_check` | 动漫风格：posterize 平涂 / 描边 / 色相保持 / roughness 压低 |
 | `tg_pitch_test` | 材质球交互：拖下看顶、360° 无洞、松手恢复自转 |
 | `tg_rotate_sweep` | 全角度旋转扫描：无背剔洞 |

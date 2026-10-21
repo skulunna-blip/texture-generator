@@ -59,11 +59,11 @@ void check(bool ok, const char* what, const QString& detail = QString())
     }
 }
 
-double heightAt(int x, int y)
+double heightAt(double x, double y, double amplitude = 1.0)
 {
     const double u = 2.0 * 3.141592653589793 * x / 128.0;
     const double v = 2.0 * 3.141592653589793 * y / 256.0;
-    return 0.5 + 0.22 * std::sin(u) + 0.12 * std::sin(v);
+    return 0.5 + amplitude * (0.22 * std::sin(u) + 0.12 * std::sin(v));
 }
 
 // Decodes the exported normal into unit vectors.
@@ -164,12 +164,59 @@ double meanTiltDeg(const std::vector<double>& n, int width, int height, int marg
     return count > 0 ? total / count : 0.0;
 }
 
-QImage makeSmoothSource()
+// Relief-carrying signal for the amplitude test. The smooth wave above sits at
+// a wavelength the height field barely responds to, so its normal lands on the
+// 8-bit export quantum (~0.2 deg) and two different amplitudes there would
+// compare equal for the wrong reason. This one has wavelengths inside the
+// bands the pipeline actually uses, so the tilt is degrees, not quantum.
+double reliefAt(double x, double y, double amplitude)
 {
+    const double a = 2.0 * 3.141592653589793 * x / 24.0;
+    const double b = 2.0 * 3.141592653589793 * y / 40.0;
+    return 0.5 + amplitude * (0.22 * std::sin(a) + 0.15 * std::sin(b));
+}
+
+QImage makeReliefSource(double amplitude)
+{
+    constexpr int kSamples = 8;
     QImage source(kSize, kSize, QImage::Format_RGB32);
     for (int y = 0; y < kSize; ++y) {
         for (int x = 0; x < kSize; ++x) {
-            const int c = static_cast<int>(std::lround(std::max(0.0, std::min(1.0, heightAt(x, y))) * 255.0));
+            double acc = 0.0;
+            for (int sy = 0; sy < kSamples; ++sy) {
+                for (int sx = 0; sx < kSamples; ++sx) {
+                    acc += reliefAt(x + (sx + 0.5) / kSamples, y + (sy + 0.5) / kSamples, amplitude)
+                         / double(kSamples * kSamples);
+                }
+            }
+            const int c = static_cast<int>(std::lround(std::max(0.0, std::min(1.0, acc)) * 255.0));
+            source.setPixel(x, y, qRgb(c, c, c));
+        }
+    }
+    return source;
+}
+
+QImage makeSmoothSource(double amplitude = 1.0)
+{
+    // Box-filtered oversampling. Quantising the analytic wave straight to 8
+    // bits leaves a +-0.5 level sawtooth on a slope of about two levels per
+    // pixel, which is a 20% slope error at every pixel. That is source
+    // quantisation, not pipeline rounding, and once the normal gain was made
+    // strong enough to read on a real photo it dominated this measurement.
+    // Averaging 64 analytic samples per pixel pushes it below what the
+    // pipeline itself contributes, so the check measures the pipeline again.
+    constexpr int kSamples = 8;
+    QImage source(kSize, kSize, QImage::Format_RGB32);
+    for (int y = 0; y < kSize; ++y) {
+        for (int x = 0; x < kSize; ++x) {
+            double acc = 0.0;
+            for (int sy = 0; sy < kSamples; ++sy) {
+                for (int sx = 0; sx < kSamples; ++sx) {
+                    acc += heightAt(x + (sx + 0.5) / kSamples, y + (sy + 0.5) / kSamples, amplitude)
+                         / double(kSamples * kSamples);
+                }
+            }
+            const int c = static_cast<int>(std::lround(std::max(0.0, std::min(1.0, acc)) * 255.0));
             source.setPixel(x, y, qRgb(c, c, c));
         }
     }
@@ -219,13 +266,14 @@ struct NormalStats
     bool valid = false;
 };
 
-NormalStats measure(const QImage& source, TextureBackendMode backend)
+NormalStats measure(const QImage& source, TextureBackendMode backend, double bump = 1.0,
+                    std::vector<double>* normalsOut = nullptr)
 {
     TextureOptions options;
     options.resolution = kSize;
     options.square = true;
     options.seamless = true;
-    options.bumpStrength = 1.0;
+    options.bumpStrength = bump;
     options.normalStrength = 1.0;
     options.backendMode = backend;
     options.styleMode = StyleMode::Realistic;
@@ -248,6 +296,9 @@ NormalStats measure(const QImage& source, TextureBackendMode backend)
     int width = 0;
     int height = 0;
     const std::vector<double> decoded = decodeNormals(normal, width, height);
+    if (normalsOut) {
+        *normalsOut = decoded;
+    }
     std::vector<double> smooth = decoded;
     for (int c = 0; c < 3; ++c) {
         const std::vector<double> blurred = blurComponent(decoded, width, height, c, 16);
@@ -280,7 +331,14 @@ int main(int argc, char** argv)
 
     // --- 1. A smooth surface gets a smooth normal --------------------------
     {
-        const NormalStats stats = measure(makeSmoothSource(), TextureBackendMode::EnhancedDetail);
+        // Measured at the lowest relief setting on purpose. The normal map
+        // exports as 8-bit, so one step is about 0.2 degrees of tilt: at high
+        // gain that quantum is itself the roughness being measured, and the
+        // check would be reading the export format instead of the pipeline.
+        // At the low end the quantum is far below the threshold, while the
+        // staircase this guards against - 8-bit intermediate blurs - is a step
+        // in the height field and shows up identically at any gain.
+        const NormalStats stats = measure(makeSmoothSource(), TextureBackendMode::EnhancedDetail, 0.2);
         check(stats.valid, "smooth source produced a normal map");
         if (stats.valid) {
             check(stats.roughness <= kMaxRoughnessDeg, "smooth surface: normal is not a staircase",
@@ -312,6 +370,87 @@ int main(int argc, char** argv)
             check(stats.tilt >= 8.0, "textured source: relief survives",
                   QStringLiteral("tilt %1 deg, floor 8.0").arg(stats.tilt, 0, 'f', 3));
         }
+    }
+
+    // --- 3. The same surface at different contrast gives the same relief ---
+    // This is what auto-levels in the height domain buys, and it is the check
+    // the old slope-normalised gain would fail: that one could only boost a
+    // low-contrast source by a fixed factor, so a third-amplitude copy of the
+    // same wave came back with roughly a third of the tilt.
+    {
+        std::vector<double> full;
+        std::vector<double> faint;
+        const NormalStats a = measure(makeReliefSource(1.0), TextureBackendMode::EnhancedDetail, 1.0, &full);
+        const NormalStats b = measure(makeReliefSource(0.35), TextureBackendMode::EnhancedDetail, 1.0, &faint);
+        check(a.valid && b.valid, "both contrast variants produced a normal map");
+        if (a.valid && b.valid) {
+            const double angle = angleDeg(full, faint, kSize, kSize, 40);
+            check(angle <= 3.0, "contrast does not change the relief",
+                  QStringLiteral("full vs 35% amplitude differ by %1 deg, limit 3.0 "
+                                 "(mean tilt %2 vs %3 deg)")
+                        .arg(angle, 0, 'f', 2)
+                        .arg(a.tilt, 0, 'f', 3)
+                        .arg(b.tilt, 0, 'f', 3));
+        }
+    }
+
+    // --- 4. The bump map is auto-levelled like the normal map --------------
+    // The export used to be the raw height field, so a low-contrast photo gave
+    // a low-contrast bump while the normal map derived from the same field had
+    // already been stretched - the two disagreed about the same surface. The
+    // floor is generous on purpose: this is checking that the stretch happens
+    // at all, not pinning its exact strength.
+    {
+        TextureOptions options;
+        options.resolution = kSize;
+        options.square = true;
+        options.seamless = true;
+        options.bumpStrength = 1.0;
+        options.backendMode = TextureBackendMode::EnhancedDetail;
+        options.generateBaseColor = false;
+        options.generateBump = true;
+        options.generateNormal = false;
+        options.generateRoughness = false;
+        options.generateMetal = false;
+        options.generateAo = false;
+        options.generateAlpha = false;
+
+        auto spread = [&](const QImage& source, double bumpStrength) {
+            TextureOptions local = options;
+            local.bumpStrength = bumpStrength;
+            const QImage bump = TextureGenerator::preview(source, local)
+                                    .images.value(QStringLiteral("bump"))
+                                    .convertToFormat(QImage::Format_Grayscale8);
+            if (bump.isNull()) {
+                return -1.0;
+            }
+            double sum = 0.0;
+            double sumSquares = 0.0;
+            long count = 0;
+            for (int y = 0; y < bump.height(); ++y) {
+                const uchar* line = bump.constScanLine(y);
+                for (int x = 0; x < bump.width(); ++x) {
+                    sum += line[x];
+                    sumSquares += static_cast<double>(line[x]) * line[x];
+                    ++count;
+                }
+            }
+            const double mean = sum / count;
+            return std::sqrt(std::max(0.0, sumSquares / count - mean * mean));
+        };
+
+        const double full = spread(makeReliefSource(1.0), 1.0);
+        const double faint = spread(makeReliefSource(0.35), 1.0);
+        check(full > 0.0 && faint >= full * 0.8, "a faint source still fills the bump range",
+              QStringLiteral("stddev %1 at full amplitude, %2 at 35%")
+                  .arg(full, 0, 'f', 2)
+                  .arg(faint, 0, 'f', 2));
+
+        const double half = spread(makeReliefSource(1.0), 0.5);
+        check(half > 0.0 && half < full * 0.8, "the relief slider still moves the bump",
+              QStringLiteral("stddev %1 at gain 1.0, %2 at gain 0.5")
+                  .arg(full, 0, 'f', 2)
+                  .arg(half, 0, 'f', 2));
     }
 
     std::printf("HEIGHT %s (%d failure%s)\n", failures == 0 ? "ALL PASS" : "FAILED", failures,

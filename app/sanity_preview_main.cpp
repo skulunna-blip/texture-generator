@@ -82,6 +82,8 @@ int main(int argc, char** argv)
         return count > 0 ? sum / count : 0.0;
     };
 
+    int failures = 0;
+
     QTimer::singleShot(1800, &app, [&]() {
         const double full = meanGray();
         std::printf("SANITY_MEAN_GRAY %.2f\n", full);
@@ -92,6 +94,20 @@ int main(int argc, char** argv)
         const double normalOnly = meanGray();
         std::printf("SANITY_NORMAL_MEAN %.2f\n", normalOnly);
         std::fflush(stdout);
+        // "Normal Only" is the normal map's own pixels. The flat identity
+        // normal fed in here is (128,128,255), so the ball has to come back
+        // blue-dominant; a lit grey surface is exactly what this mode must not
+        // be any more.
+        const QImage shot = widget.grabFramebuffer();
+        const QRgb centre = shot.pixel(shot.width() / 2, shot.height() / 2);
+        const bool blueDominant = qBlue(centre) > qRed(centre) + 40
+            && qBlue(centre) > qGreen(centre) + 40;
+        std::printf("SANITY_NORMAL_VIEW %s r=%d g=%d b=%d\n", blueDominant ? "PASS" : "FAIL",
+                    qRed(centre), qGreen(centre), qBlue(centre));
+        std::fflush(stdout);
+        if (!blueDominant) {
+            ++failures;
+        }
         widget.setPreviewMode(MaterialPreviewWidget::PreviewMode::BumpOnly);
     });
     QTimer::singleShot(3400, &app, [&]() {
@@ -101,5 +117,9 @@ int main(int argc, char** argv)
         app.quit();
     });
 
-    return app.exec();
+    const int code = app.exec();
+    std::printf("SANITY %s (%d failure%s)\n", failures == 0 ? "ALL PASS" : "FAILED", failures,
+                failures == 1 ? "" : "s");
+    std::fflush(stdout);
+    return failures == 0 ? code : 1;
 }

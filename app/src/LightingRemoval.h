@@ -35,6 +35,20 @@ public:
     //           stays tileable.
     static QImage remove(const QImage& image, const QImage& depth, double strength, bool wrap);
 
+    // Rebuilds blown-out highlights only, and only on a photograph.
+    //
+    // "Blown" is a property of the sensor, not of the texture: a pixel that
+    // railed at 255 has lost its colour entirely and has to be reinvented from
+    // its surroundings. Once the seamless pass has run, the pyramid blend drags
+    // those pixels down to 251, so the evidence that they were ever clipped is
+    // gone and the stage has nothing to work with - the highlight survives as a
+    // flat grey disc. Callers that tile must therefore run this first, on the
+    // source, and let the seamless pass tile the repaired result.
+    //
+    // Costs one pass; a no-op unless the image actually has a plateau at its own
+    // ceiling. Returns `image` unchanged when there is nothing to rebuild.
+    static QImage restoreClippedHighlights(const QImage& image);
+
     // Self-check for the sRGB conversion tables. The sRGB <-> linear round trip
     // is 80% of this pass's runtime, so it is table-driven rather than calling
     // std::pow() per pixel; the tables are built on the 8-bit output grid so

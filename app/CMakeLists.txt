@@ -18,6 +18,9 @@ qt_add_executable(TextureGeneratorQt
     src/MainWindow.cpp
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -140,6 +143,9 @@ target_compile_definitions(tg_pitch_test
 qt_add_executable(tg_seam_check
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -166,6 +172,29 @@ target_compile_definitions(tg_seam_check
         QT_NO_CAST_TO_ASCII
 )
 
+qt_add_executable(tg_seam_cut
+    src/SeamCut.h
+    src/SeamCut.cpp
+    seam_cut_main.cpp
+)
+
+target_include_directories(tg_seam_cut
+    PRIVATE
+        src
+)
+
+target_link_libraries(tg_seam_cut
+    PRIVATE
+        Qt6::Core
+        Qt6::Gui
+)
+
+target_compile_definitions(tg_seam_cut
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
 qt_add_executable(tg_orientation_test
     src/MaterialPreviewWidget.h
     src/MaterialPreviewWidget.cpp
@@ -187,9 +216,66 @@ target_compile_definitions(tg_orientation_test
         QT_NO_CAST_TO_ASCII
 )
 
+qt_add_executable(tg_patch_synth_check
+    src/PatchSynthesis.h
+    src/PatchSynthesis.cpp
+    src/TextureGenerator.h
+    src/TextureGenerator.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
+    src/LightingRemoval.h
+    src/LightingRemoval.cpp
+    src/DepthEstimator.h
+    src/DepthEstimator.cpp
+    src/OnnxRuntime.h
+    patch_synth_check_main.cpp
+)
+
+target_include_directories(tg_patch_synth_check
+    PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include
+)
+
+target_link_libraries(tg_patch_synth_check
+    PRIVATE
+        Qt6::Gui
+        Qt6::Core
+)
+
+target_compile_definitions(tg_patch_synth_check
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
+qt_add_executable(tg_v_orientation_test
+    src/MaterialPreviewWidget.h
+    src/MaterialPreviewWidget.cpp
+    v_orientation_test_main.cpp
+)
+
+target_include_directories(tg_v_orientation_test PRIVATE src)
+
+target_link_libraries(tg_v_orientation_test
+    PRIVATE
+        Qt6::Widgets
+        Qt6::OpenGL
+        Qt6::OpenGLWidgets
+)
+
+target_compile_definitions(tg_v_orientation_test
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
 qt_add_executable(tg_style_check
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -218,6 +304,9 @@ target_compile_definitions(tg_style_check
 qt_add_executable(tg_height_precision
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -238,6 +327,64 @@ target_link_libraries(tg_height_precision
 )
 
 target_compile_definitions(tg_height_precision
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
+qt_add_executable(tg_square_test
+    src/TextureGenerator.h
+    src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
+    src/LightingRemoval.h
+    src/LightingRemoval.cpp
+    src/DepthEstimator.h
+    src/DepthEstimator.cpp
+    src/OnnxRuntime.h
+    square_fit_main.cpp
+)
+target_include_directories(tg_square_test
+    PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include
+)
+target_link_libraries(tg_square_test PRIVATE Qt6::Core Qt6::Gui)
+target_compile_definitions(tg_square_test
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
+# Prints where the live preview's time goes. Not an assertion: a timing
+# threshold is a flaky test on a busy machine, and the point here is the number.
+qt_add_executable(tg_preview_timing
+    src/TextureGenerator.h
+    src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
+    src/LightingRemoval.h
+    src/LightingRemoval.cpp
+    src/DepthEstimator.h
+    src/DepthEstimator.cpp
+    src/OnnxRuntime.h
+    preview_timing_main.cpp
+)
+target_include_directories(tg_preview_timing
+    PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include
+)
+
+target_link_libraries(tg_preview_timing
+    PRIVATE
+        Qt6::Core
+        Qt6::Gui
+)
+
+target_compile_definitions(tg_preview_timing
     PRIVATE
         QT_NO_CAST_FROM_ASCII
         QT_NO_CAST_TO_ASCII
@@ -338,6 +485,9 @@ target_compile_definitions(tg_delight_check
 qt_add_executable(tg_neural_check
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -398,6 +548,9 @@ target_compile_definitions(tg_depth_check
 qt_add_executable(tg_upscale_test
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h
@@ -426,6 +579,74 @@ target_compile_definitions(tg_upscale_test
         QT_NO_CAST_TO_ASCII
 )
 
+# Writes PNGs rather than asserting: the seam is a thing you look at. Run it on
+# a real photo to see what the seamless pass did, flat and tiled.
+qt_add_executable(tg_seam_visual
+    src/TextureGenerator.h
+    src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
+    src/LightingRemoval.h
+    src/LightingRemoval.cpp
+    src/DepthEstimator.h
+    src/DepthEstimator.cpp
+    src/OnnxRuntime.h
+    seam_visual_main.cpp
+)
+
+target_include_directories(tg_seam_visual
+    PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include
+)
+
+target_link_libraries(tg_seam_visual
+    PRIVATE
+        Qt6::Core
+        Qt6::Gui
+)
+
+target_compile_definitions(tg_seam_visual
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
+# Write the de-lit result next to its input. Same bargain as tg_seam_visual:
+# not a test, a way to look at the pixels a complaint is actually about.
+qt_add_executable(tg_delight_visual
+    src/TextureGenerator.h
+    src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
+    src/LightingRemoval.h
+    src/LightingRemoval.cpp
+    src/DepthEstimator.h
+    src/DepthEstimator.cpp
+    src/OnnxRuntime.h
+    delight_visual_main.cpp
+)
+
+target_include_directories(tg_delight_visual
+    PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include
+)
+
+target_link_libraries(tg_delight_visual
+    PRIVATE
+        Qt6::Core
+        Qt6::Gui
+)
+
+target_compile_definitions(tg_delight_visual
+    PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+)
+
 # Drives the real MainWindow, so it pulls in the whole application apart from
 # main.cpp. Worth the build cost: dropping a file is wiring, and wiring is what
 # compiles cleanly while being broken.
@@ -434,6 +655,9 @@ qt_add_executable(tg_drop_test
     src/MainWindow.cpp
     src/TextureGenerator.h
     src/TextureGenerator.cpp
+    src/PatchSynthesis.cpp
+    src/SeamCut.h
+    src/SeamCut.cpp
     src/LightingRemoval.h
     src/LightingRemoval.cpp
     src/DepthEstimator.h

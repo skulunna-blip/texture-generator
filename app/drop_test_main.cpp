@@ -13,6 +13,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QImage>
+#include <QImageReader>
 #include <QLabel>
 #include <QMimeData>
 #include <QTemporaryDir>
@@ -132,6 +133,46 @@ int main(int argc, char** argv)
         QApplication::sendEvent(&window, &enter);
         check(!enter.isAccepted(), "text file refused on enter");
         delete mime;
+    }
+
+    // --- 2b. A refused file says why, and says the truth about formats ----
+    // Refusing with a "no entry" cursor and no words is what makes a working
+    // feature look broken, which is exactly the report this guards against. The
+    // advertised list is checked against the reader rather than against a
+    // literal: this build has no WebP plugin, so promising *.webp would send
+    // the user off to pick a file the app cannot open.
+    {
+        QLabel* message = window.findChild<QLabel*>(QStringLiteral("messageBar"));
+        check(message != nullptr, "message bar exists");
+        QMimeData* mime = urlsFor({textPath});
+        const QPointF at(40, 40);
+        QDragEnterEvent enter(at.toPoint(), Qt::CopyAction, mime, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&window, &enter);
+        const QString text = message ? message->text() : QString();
+        check(!enter.isAccepted() && text.contains(QStringLiteral("*.png")),
+              "a refused file explains what is supported", text);
+        const bool webpReadable =
+            QImageReader::supportedImageFormats().contains(QByteArrayLiteral("webp"));
+        check(text.contains(QStringLiteral("*.webp")) == webpReadable,
+              "only readable formats are advertised",
+              QStringLiteral("webp readable: %1").arg(webpReadable ? QStringLiteral("yes")
+                                                                  : QStringLiteral("no")));
+        delete mime;
+    }
+
+    // --- 2c. A drop that is not on disk says that too ---------------------
+    // Dragging a picture straight out of a browser or a chat window is a normal
+    // thing to try, and it has a different fix from "wrong file type".
+    {
+        QLabel* message = window.findChild<QLabel*>(QStringLiteral("messageBar"));
+        QMimeData mime;
+        mime.setUrls({QUrl(QStringLiteral("https://example.com/texture.png"))});
+        const QPointF at(40, 40);
+        QDragEnterEvent enter(at.toPoint(), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&window, &enter);
+        const QString text = message ? message->text() : QString();
+        check(!enter.isAccepted() && !text.isEmpty() && !text.contains(QStringLiteral("*.png")),
+              "a non-local drop is told to save it first", text);
     }
 
     // --- 3. A mixed drop picks the image ----------------------------------

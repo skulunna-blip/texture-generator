@@ -1,18 +1,52 @@
 #include "TextureGenerator.h"
 
+#include "PatchSynthesis.h"
+
 #include "DepthEstimator.h"
 #include "LightingRemoval.h"
+#include "SeamCut.h"
 
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QMutex>
 
+#include <cstdio>
 #include <stdexcept>
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
+#include <vector>
 
 namespace
 {
+// Set TG_PROFILE=1 to have buildResult print where its time went. The preview
+// is interactive, so "it feels slow" has to become a stage breakdown before
+// anything is worth changing; tg_preview_timing drives the configurations and
+// this says which stage inside them is the cost.
+struct Profile
+{
+    QElapsedTimer timer;
+    bool enabled = qEnvironmentVariableIsSet("TG_PROFILE");
+
+    Profile()
+    {
+        if (enabled) {
+            timer.start();
+        }
+    }
+
+    void step(const char* label)
+    {
+        if (!enabled) {
+            return;
+        }
+        std::printf("PROFILE %-16s %5lld ms\n", label, static_cast<long long>(timer.restart()));
+        std::fflush(stdout);
+    }
+};
+
 QImage cropToSquare(const QImage& source)
 {
     const int side = std::min(source.width(), source.height());
@@ -20,10 +54,65 @@ QImage cropToSquare(const QImage& source)
     return source.copy(rect);
 }
 
+// Square by reflection: the short side is grown by mirroring the picture back
+// and forth. Nothing is distorted and nothing is invented, which is exactly
+// what a texture with a repeating pattern wants; on a photograph the mirror
+// axes are visible as symmetry.
+QImage mirrorToSquare(const QImage& source)
+{
+    const int side = std::max(source.width(), source.height());
+    QImage out(side, side, QImage::Format_ARGB32_Premultiplied);
+    out.fill(Qt::transparent);
+    const int w = source.width();
+    const int h = source.height();
+    const QImage src = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < side; ++y) {
+        // Reflect every `h` rows; an odd period needs the fold, an even one a
+        // plain modulo. The fold is what keeps out(0) == out(side-1).
+        const int sy = h <= 1 ? 0 : (y < h ? y : (y / h) % 2 == 0 ? y % h : h - 1 - (y % h));
+        const QRgb* in = reinterpret_cast<const QRgb*>(src.constScanLine(sy));
+        QRgb* line = reinterpret_cast<QRgb*>(out.scanLine(y));
+        for (int x = 0; x < side; ++x) {
+            const int sx = w <= 1 ? 0 : (x < w ? x : (x / w) % 2 == 0 ? x % w : w - 1 - (x % w));
+            line[x] = in[sx];
+        }
+    }
+    return out;
+}
+
 int wrapIndex(int index, int mod)
 {
     int v = index % mod;
     return v < 0 ? v + mod : v;
+}
+
+// Separable box blur of a 0..1 mask, wrapping at the edges. Used to soften the
+// seam cut per pyramid level.
+std::vector<float> blurMask(const std::vector<float>& mask, int width, int height, int radius)
+{
+    const float inverseWindow = 1.0f / static_cast<float>(2 * radius + 1);
+    std::vector<float> horizontal(mask.size(), 0.0f);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float sum = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                sum += mask[static_cast<size_t>(y) * width + wrapIndex(x + k, width)];
+            }
+            horizontal[static_cast<size_t>(y) * width + x] = sum * inverseWindow;
+        }
+    }
+
+    std::vector<float> out(mask.size(), 0.0f);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float sum = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                sum += horizontal[static_cast<size_t>(wrapIndex(y + k, height)) * width + x];
+            }
+            out[static_cast<size_t>(y) * width + x] = sum * inverseWindow;
+        }
+    }
+    return out;
 }
 
 QImage boxBlurGray(const QImage& image, int radius, bool wrap)
@@ -166,10 +255,24 @@ HeightField boxBlurField(const HeightField& src, int radius, bool wrap)
     return out;
 }
 
+// Auto-levels for a height field: the 1st..99th percentile of the height is
+// stretched to the full range, the way a height-to-normal tool does it. A
+// normal map derived from the raw field inherits the photo's contrast, so the
+// same slider did wildly different things on a flat wall and on a brick; the
+// stretch removes that dependence. It is capped, because a source with no
+// relief at all has a height range made of sensor noise and auto-levels would
+// promote that noise to the whole range.
+struct HeightLevels
+{
+    double low = 0.0;
+    double stretch = 1.0;
+};
+HeightLevels heightLevels(const HeightField& field);
+
 // The 8-bit image is an export format, not part of the computation. This is the
 // only place the height field is allowed to lose precision. Defined below
 // scaledRadius so it can use saturate().
-QImage heightFieldToImage(const HeightField& field);
+QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain);
 
 QString timeStampedJobId()
 {
@@ -225,13 +328,57 @@ int scaledRadius(int baseRadius, const QImage& image)
 
 // The 8-bit image is an export format, not part of the computation. This is the
 // only place the height field is allowed to lose precision.
-QImage heightFieldToImage(const HeightField& field)
+HeightLevels heightLevels(const HeightField& field)
 {
+    constexpr double kMaxStretch = 8.0;
+    constexpr int kBins = 1024;
+    HeightLevels levels;
+    if (field.width <= 0 || field.height <= 0) {
+        return levels;
+    }
+
+    std::vector<long long> histogram(static_cast<size_t>(kBins), 0);
+    for (int y = 0; y < field.height; ++y) {
+        for (int x = 0; x < field.width; ++x) {
+            const double v = std::clamp(static_cast<double>(field.at(x, y)), 0.0, 1.0);
+            const int bin = std::clamp(static_cast<int>(v * (kBins - 1) + 0.5), 0, kBins - 1);
+            ++histogram[static_cast<size_t>(bin)];
+        }
+    }
+    auto percentile = [&](double p) {
+        const long long wanted = static_cast<long long>(p * field.width * field.height);
+        long long running = 0;
+        for (int b = 0; b < kBins; ++b) {
+            running += histogram[static_cast<size_t>(b)];
+            if (running >= wanted) {
+                return static_cast<double>(b) / (kBins - 1);
+            }
+        }
+        return 1.0;
+    };
+
+    levels.low = percentile(0.01);
+    const double high = percentile(0.99);
+    const double range = high - levels.low;
+    levels.stretch = range > 1e-6 ? std::min(1.0 / range, kMaxStretch) : kMaxStretch;
+    return levels;
+}
+
+QImage heightFieldToImage(const HeightField& field, const HeightLevels& levels, double gain)
+{
+    // The same two steps the normal map takes: auto-levels first, then the
+    // relief slider as a plain contrast gain. Exporting the raw field instead
+    // meant the bump map kept the source's contrast while the normal map did
+    // not - the two disagreed about the same surface, and moving the slider
+    // changed one and (after the leveling) not the other.
+    const double clampedGain = std::clamp(gain, 0.0, 3.0);
     QImage out(field.width, field.height, QImage::Format_Grayscale8);
     for (int y = 0; y < field.height; ++y) {
         uchar* line = out.scanLine(y);
         for (int x = 0; x < field.width; ++x) {
-            line[x] = static_cast<uchar>(saturate(field.at(x, y)) * 255.0);
+            const double level = (static_cast<double>(field.at(x, y)) - levels.low) * levels.stretch;
+            const double value = 0.5 + (level - 0.5) * clampedGain;
+            line[x] = static_cast<uchar>(saturate(value) * 255.0);
         }
     }
     return out;
@@ -280,10 +427,78 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
         return result;
     }
 
-    QImage prepared = prepareSource(source, options);
-    if (options.seamless) {
-        prepared = makeSeamless(prepared);
+    Profile profile;
+
+    // Preparing the source is a third of a preview frame - the crop/scale plus,
+    // when seamless is on, the pyramid blend - and it depends only on the source
+    // and the output geometry. None of the sliders touch it, so during a drag
+    // the source is byte-identical and every frame after the first was doing
+    // the same work again to get the same pixels. Caching it is worth more than
+    // any optimisation inside it: the first frame pays, the rest are free.
+    //
+    // The cache keeps a reference to the source image, which costs no memory
+    // (QImage is implicitly shared) and keeps its cacheKey from being recycled
+    // by another image while this entry is still valid.
+    static QMutex cacheMutex;
+    static QImage cachedSource;
+    static qint64 cachedSourceKey = -1;
+    static int cachedResolution = -1;
+    static bool cachedSquare = false;
+    static SquareFit cachedSquareFit = SquareFit::Crop;
+    static bool cachedSeamless = false;
+    static SeamlessMode cachedSeamlessMode = SeamlessMode::Blend;
+    static bool cachedClipRepair = false;
+    static QImage cachedPrepared;
+
+    // Clipped highlights have to be rebuilt on the photograph, before the
+    // seamless pass, because "blown" is evidence the seamless pass destroys:
+    // its pyramid blend averages the two borders and drags a railed 255 core
+    // down to 251, which is below any clip threshold worth having. Measured on
+    // a real 1024 tile photo, the stage then found 15 pixels where the photo
+    // had ten thousand, and the highlight came back as a flat grey disc. It
+    // also fixes what the tile looks like: repairing after the blend repeats
+    // the repaired highlight in all nine copies.
+    const bool clipRepair = options.removeLighting && options.delightStrength > 0.0;
+
+    QImage prepared;
+    {
+        QMutexLocker locker(&cacheMutex);
+        const bool hit = !cachedPrepared.isNull()
+            && cachedSourceKey == source.cacheKey()
+            && cachedResolution == options.resolution
+            && cachedSquare == options.square
+            && cachedSquareFit == options.squareFit
+            && cachedSeamless == options.seamless
+            && cachedSeamlessMode == options.seamlessMode
+            && cachedClipRepair == clipRepair;
+        if (hit) {
+            prepared = cachedPrepared;
+        } else {
+            prepared = prepareSource(source, options);
+            profile.step("prepare");
+            if (clipRepair) {
+                // Unwrapped on purpose: the source does not tile yet, and
+                // wrapping here would let the fill borrow donor pixels across
+                // the border of a discontinuity that does not exist in reality.
+                prepared = LightingRemoval::restoreClippedHighlights(prepared);
+            }
+            profile.step("cliprepair");
+            if (options.seamless) {
+                prepared = makeSeamless(prepared, options.seamlessMode);
+            }
+            profile.step("seamless");
+            cachedPrepared = prepared;
+            cachedSource = source;
+            cachedSourceKey = source.cacheKey();
+            cachedResolution = options.resolution;
+            cachedSquare = options.square;
+            cachedSquareFit = options.squareFit;
+            cachedSeamless = options.seamless;
+            cachedSeamlessMode = options.seamlessMode;
+            cachedClipRepair = clipRepair;
+        }
     }
+    profile.step("source");
 
     result.size = prepared.size();
 
@@ -329,19 +544,31 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
     }
 
     HeightField height = createHeightField(prepared, options.bumpStrength, options.backendMode, wrap);
+    profile.step("height");
     if (!depth.isNull()) {
         height = mergeDepthRelief(height, depth, options.bumpStrength, wrap);
     }
     if (options.generateBump) {
+        // Auto-levels here too, so the bump map and the normal map describe the
+        // same relief at the same contrast instead of the bump keeping whatever
+        // contrast the photograph happened to have.
+        const HeightLevels levels = heightLevels(height);
         storeImage(result,
                    QStringLiteral("bump"),
                    QStringLiteral("bump.png"),
-                   heightFieldToImage(height),
+                   heightFieldToImage(height, levels, options.bumpStrength),
                    writeFiles);
     }
 
     if (options.generateNormal) {
-        const QImage normal = createNormalMap(height, options.normalStrength, options.backendMode, wrap);
+        // The relief slider and the normal strength are one control as far as
+        // the map is concerned: createNormalMap() auto-levels the height before
+        // it differentiates, which removes the amplitude the bump slider put
+        // there. Feeding the bump strength into the gain again is what keeps
+        // that slider moving the normals.
+        const QImage normal = createNormalMap(height, options.normalStrength * options.bumpStrength,
+                                              options.backendMode, wrap);
+        profile.step("normal");
         storeImage(result,
                    QStringLiteral("normal"),
                    QStringLiteral("normal.png"),
@@ -404,13 +631,187 @@ TextureResult TextureGenerator::buildResult(const QImage& source, const TextureO
     return result;
 }
 
+// Square by synthesis: keep the picture and grow the short side with the patch
+// engine. This is the only one of the fits that puts new content in, so it is
+// the one to pick when a photograph has to fill the square and cropping would
+// lose the subject - and the one that stops being believable when the gap is
+// large, because everything it adds is copied from what it can see.
+QImage resynthesizeToSquare(const QImage& source)
+{
+    const int side = std::max(source.width(), source.height());
+    const QImage src = source.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage canvas(w, side, QImage::Format_ARGB32);
+    canvas.fill(Qt::black);
+    for (int y = 0; y < h; ++y) {
+        std::copy(src.constScanLine(y), src.constScanLine(y) + w * 4,
+                  canvas.scanLine(y));
+    }
+    QImage mask(w, side, QImage::Format_Grayscale8);
+    mask.fill(0);
+    for (int y = h; y < side; ++y) {
+        uchar* line = mask.scanLine(y);
+        std::memset(line, 255, static_cast<size_t>(w));
+    }
+    PatchSynthOptions options;
+    options.vote = true;
+    options.multiscale = true;
+    options.iterations = 3;
+    options.wrap = false; // the picture is the only context; there is nothing below
+    QImage grown = patchSynthesis(canvas, mask, options);
+    if (grown.isNull()) {
+        grown = canvas;
+    }
+    return grown.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+}
+
+// Square by content-aware resize - the idea Liquid Rescale is built on. Cut the
+// least noticeable vertical (or horizontal) seams until the long side matches
+// the short one. Every remaining pixel is the picture's own, at its own scale,
+// which is what makes it work on a photograph; the price is that long straight
+// edges visibly bend.
+QImage seamCarveToSquare(const QImage& source)
+{
+    QImage image = source.convertToFormat(QImage::Format_ARGB32);
+    const int finish = std::min(image.width(), image.height());
+    const bool vertical = image.width() > image.height();
+
+    // Flat working arrays rather than QImage::pixel(): the dynamic program runs
+    // once per removed seam, and at 1024x768 that is 256 x 786k cells. Pixel
+    // accessors turned that into 40 s; plain indexing keeps it near one.
+    std::vector<unsigned char> lum;
+    std::vector<double> energy;
+    std::vector<double> cost;
+    std::vector<int> seam;
+
+    auto rebuild = [&]() {
+        const int w = image.width();
+        const int h = image.height();
+        lum.assign(static_cast<size_t>(w) * h, 0);
+        for (int y = 0; y < h; ++y) {
+            const QRgb* line = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+            unsigned char* out = &lum[static_cast<size_t>(y) * w];
+            for (int x = 0; x < w; ++x) {
+                out[x] = static_cast<unsigned char>(qGray(line[x]));
+            }
+        }
+        energy.assign(static_cast<size_t>(w) * h, 0.0);
+        for (int y = 0; y < h; ++y) {
+            const int y0 = std::max(0, y - 1);
+            const int y1 = std::min(h - 1, y + 1);
+            for (int x = 0; x < w; ++x) {
+                const int x0 = std::max(0, x - 1);
+                const int x1 = std::min(w - 1, x + 1);
+                const double dx = static_cast<double>(lum[static_cast<size_t>(y) * w + x1])
+                                - lum[static_cast<size_t>(y) * w + x0];
+                const double dy = static_cast<double>(lum[static_cast<size_t>(y1) * w + x])
+                                - lum[static_cast<size_t>(y0) * w + x];
+                energy[static_cast<size_t>(y) * w + x] = std::abs(dx) + std::abs(dy);
+            }
+        }
+    };
+
+    auto findSeam = [&]() {
+        const int w = image.width();
+        const int h = image.height();
+        // The seam advances along the long axis and picks a position across it:
+        // a vertical seam walks down the rows choosing an x.
+        const int along = vertical ? h : w;
+        const int across = vertical ? w : h;
+        auto index = [&](int a, int c) {
+            const int x = vertical ? c : a;
+            const int y = vertical ? a : c;
+            return static_cast<size_t>(y) * w + x;
+        };
+        cost.assign(energy.size(), 0.0);
+        for (int a = 0; a < along; ++a) {
+            for (int c = 0; c < across; ++c) {
+                double best = 0.0;
+                if (a > 0) {
+                    best = cost[index(a - 1, c)];
+                    if (c > 0) {
+                        best = std::min(best, cost[index(a - 1, c - 1)]);
+                    }
+                    if (c + 1 < across) {
+                        best = std::min(best, cost[index(a - 1, c + 1)]);
+                    }
+                }
+                cost[index(a, c)] = energy[index(a, c)] + best;
+            }
+        }
+        seam.assign(static_cast<size_t>(along), 0);
+        int bestC = 0;
+        for (int c = 1; c < across; ++c) {
+            if (cost[index(along - 1, c)] < cost[index(along - 1, bestC)]) {
+                bestC = c;
+            }
+        }
+        seam[static_cast<size_t>(along - 1)] = bestC;
+        for (int a = along - 2; a >= 0; --a) {
+            int c = seam[static_cast<size_t>(a + 1)];
+            if (c > 0 && cost[index(a, c - 1)] < cost[index(a, c)]) {
+                c -= 1;
+            } else if (c + 1 < across && cost[index(a, c + 1)] < cost[index(a, c)]) {
+                c += 1;
+            }
+            seam[static_cast<size_t>(a)] = c;
+        }
+    };
+
+    while ((vertical ? image.width() : image.height()) > finish) {
+        rebuild();
+        findSeam();
+        if (vertical) {
+            const int w = image.width();
+            const int h = image.height();
+            QImage cut(w - 1, h, QImage::Format_ARGB32);
+            for (int y = 0; y < h; ++y) {
+                const QRgb* in = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+                QRgb* out = reinterpret_cast<QRgb*>(cut.scanLine(y));
+                const int skip = seam[static_cast<size_t>(y)];
+                std::copy(in, in + skip, out);
+                std::copy(in + skip + 1, in + w, out + skip);
+            }
+            image = cut;
+        } else {
+            const int w = image.width();
+            const int h = image.height();
+            QImage cut(w, h - 1, QImage::Format_ARGB32);
+            std::vector<int> rowOf(static_cast<size_t>(w), 0);
+            for (int x = 0; x < w; ++x) {
+                rowOf[static_cast<size_t>(x)] = seam[static_cast<size_t>(x)];
+            }
+            for (int y = 0; y < h - 1; ++y) {
+                QRgb* out = reinterpret_cast<QRgb*>(cut.scanLine(y));
+                for (int x = 0; x < w; ++x) {
+                    // Source row for this x is either y or y+1 depending on
+                    // whether its seam pixel has already been skipped.
+                    const int sy = y < rowOf[static_cast<size_t>(x)] ? y : y + 1;
+                    out[x] = image.pixel(x, sy);
+                }
+            }
+            image = cut;
+        }
+    }
+    return image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+}
+
 QImage TextureGenerator::prepareSource(const QImage& source, const TextureOptions& options)
 {
     QImage image = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QSize targetSize;
 
     if (options.square) {
-        image = cropToSquare(image);
+        if (options.squareFit == SquareFit::Crop) {
+            image = cropToSquare(image);
+        } else if (options.squareFit == SquareFit::Mirror) {
+            image = mirrorToSquare(image);
+        } else if (options.squareFit == SquareFit::Resynthesize) {
+            image = resynthesizeToSquare(image);
+        } else if (options.squareFit == SquareFit::SeamCarve) {
+            image = seamCarveToSquare(image);
+        }
         targetSize = QSize(options.resolution, options.resolution);
     } else {
         const double ratio = static_cast<double>(image.width()) / static_cast<double>(image.height());
@@ -424,7 +825,7 @@ QImage TextureGenerator::prepareSource(const QImage& source, const TextureOption
     return image.scaled(targetSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 
-QImage TextureGenerator::makeSeamless(const QImage& image)
+static QImage seamlessAxis(const QImage& image, SeamAxis axis)
 {
     // Laplacian-pyramid seamless (Burt & Adelson multiresolution spline).
     //
@@ -445,8 +846,14 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
     }
 
     // --- 1. Half-shifted copy (the thing we feather between). ---------------
-    const int halfX = width / 2;
-    const int halfY = height / 2;
+    // One axis at a time. A half-shift in *both* axes leaves the shifted copy
+    // with two discontinuity lines (one per axis), and any region that spans
+    // the tile - which is what a border ring is - has to cross one of them.
+    // Shifting on a single axis leaves exactly one such line, and the region
+    // that uses the shifted copy is then two strips on either side of it.
+    const bool horizontal = axis == SeamAxis::Horizontal;
+    const int halfX = horizontal ? width / 2 : 0;
+    const int halfY = horizontal ? 0 : height / 2;
     auto shiftPixel = [&](int x, int y) {
         return original.pixel(wrapIndex(x + halfX, width), wrapIndex(y + halfY, height));
     };
@@ -478,6 +885,35 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
         }
     }
 
+    // --- 2b. Where the two copies meet. ------------------------------------
+    // The switch has to happen somewhere, and a fixed ring around the border
+    // (what this used to do) cuts through whatever is there: every grout line
+    // it crosses is split, and the eye finds it immediately. The minimum cut
+    // through the difference of the two copies puts the switch where they
+    // already agree, so it costs nothing where it can be helped.
+    std::vector<float> maskCur(static_cast<size_t>(width) * height, 1.0f);
+    const QImage cutMask = buildSeamlessCutMask(original, axis);
+    if (!cutMask.isNull()) {
+        for (int y = 0; y < height; ++y) {
+            const uchar* line = cutMask.constScanLine(y);
+            for (int x = 0; x < width; ++x) {
+                maskCur[static_cast<size_t>(y) * width + x] = line[x] / 255.0f;
+            }
+        }
+    } else {
+        // Degenerate shapes (extreme aspect ratios leave no room for an
+        // interior) fall back to a fixed cross-fade along this axis. Worse, but
+        // always valid, and it still tiles in the axis it was given.
+        const double transition = std::max(2.0, std::min(width, height) / 12.0);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const double d = horizontal ? std::min(x, width - 1 - x) : std::min(y, height - 1 - y);
+                const double t = std::clamp(d / transition, 0.0, 1.0);
+                maskCur[static_cast<size_t>(y) * width + x] = static_cast<float>(t * t * (3.0 - 2.0 * t));
+            }
+        }
+    }
+
     int lw = width;
     int lh = height;
     for (int level = 0; level < levelCount; ++level) {
@@ -485,23 +921,20 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
         l.i = srcI.mid(0, static_cast<int>(srcI.size()));
         l.s = srcS.mid(0, static_cast<int>(srcS.size()));
 
-        // Per-level mask: distance from each pixel to the nearest edge, mapped
-        // with smoothstep. The transition width scales with the band so coarse
-        // levels blend widely and fine levels snap sharply. The mask is the same
-        // for both copies (symmetric feather).
+        // The feather has to follow the band it is applied to. Blurring by a
+        // fixed radius measured in *level* pixels makes the transition 3 px
+        // wide at full resolution (fine detail snaps to one copy, no doubling)
+        // and a third of the tile at the coarsest level (the overall colour
+        // cross-fades, which is what the multiresolution spline is for).
+        //
+        // The previous mask was a fixed fraction of the tile at every level, so
+        // every band crossed over the same ~40 image pixels - that is exactly
+        // the width over which structured detail was visible twice.
         l.mask.resize(static_cast<size_t>(lw) * lh);
-        const double transition = std::max(2.0, std::min(lw, lh) / 12.0);
-        for (int y = 0; y < lh; ++y) {
-            const double dy = std::min(y, lh - 1 - y);
-            for (int x = 0; x < lw; ++x) {
-                const double dx = std::min(x, lw - 1 - x);
-                const double dist = std::min(dx, dy) / transition;
-                double t = std::clamp(dist, 0.0, 1.0);
-                t = t * t * (3.0 - 2.0 * t); // smoothstep: 0 at edge, 1 at centre
-                l.mask[y * lw + x] = qRgb(static_cast<int>(t * 255.0),
-                                          static_cast<int>(t * 255.0),
-                                          static_cast<int>(t * 255.0));
-            }
+        const std::vector<float> soft = blurMask(maskCur, lw, lh, 1);
+        for (int i = 0; i < lw * lh; ++i) {
+            const int v = static_cast<int>(std::lround(std::clamp(soft[static_cast<size_t>(i)], 0.0f, 1.0f) * 255.0f));
+            l.mask[i] = qRgb(v, v, v);
         }
         levels.append(l);
 
@@ -513,10 +946,12 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
         const int nh = lh / 2;
         QVector<QRgb> nextI(static_cast<size_t>(nw) * nh);
         QVector<QRgb> nextS(static_cast<size_t>(nw) * nh);
+        std::vector<float> nextMask(static_cast<size_t>(nw) * nh, 0.0f);
         for (int y = 0; y < nh; ++y) {
             for (int x = 0; x < nw; ++x) {
                 int rI = 0, gI = 0, bI = 0, aI = 0;
                 int rS = 0, gS = 0, bS = 0, aS = 0;
+                float maskSum = 0.0f;
                 for (int dy = 0; dy < 2; ++dy) {
                     const int sy = std::min(lh - 1, y * 2 + dy);
                     for (int dx = 0; dx < 2; ++dx) {
@@ -525,15 +960,18 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
                         const QRgb ps = srcS[sy * lw + sx];
                         rI += qRed(pi); gI += qGreen(pi); bI += qBlue(pi); aI += qAlpha(pi);
                         rS += qRed(ps); gS += qGreen(ps); bS += qBlue(ps); aS += qAlpha(ps);
+                        maskSum += maskCur[static_cast<size_t>(sy) * lw + sx];
                     }
                 }
                 const int idx = y * nw + x;
                 nextI[idx] = qRgba(rI / 4, gI / 4, bI / 4, aI / 4);
                 nextS[idx] = qRgba(rS / 4, gS / 4, bS / 4, aS / 4);
+                nextMask[static_cast<size_t>(idx)] = maskSum * 0.25f;
             }
         }
         srcI = nextI;
         srcS = nextS;
+        maskCur = std::move(nextMask);
         lw = nw;
         lh = nh;
     }
@@ -549,22 +987,29 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
     const int coarseW = width >> (levels.size() - 1);
     const int coarseH = height >> (levels.size() - 1);
     QVector<QRgb> acc(static_cast<size_t>(coarseW) * coarseH);
+    const Level& coarsest = levels.last();
     for (int y = 0; y < coarseH; ++y) {
         for (int x = 0; x < coarseW; ++x) {
-            acc[y * coarseW + x] = levels.last().i[y * coarseW + x];
+            // The coarsest level is the overall colour, and it used to be taken
+            // from the source alone. That left the colour of one copy sitting
+            // under the detail of the other, which is a colour step at the seam
+            // that no amount of feathered detail can hide. It gets blended too.
+            const int i = y * coarseW + x;
+            const double m = qRed(coarsest.mask[i]) / 255.0;
+            const QRgb a = coarsest.i[i];
+            const QRgb b = coarsest.s[i];
+            acc[i] = qRgba(static_cast<int>(std::lround(qRed(a) * m + qRed(b) * (1.0 - m))),
+                           static_cast<int>(std::lround(qGreen(a) * m + qGreen(b) * (1.0 - m))),
+                           static_cast<int>(std::lround(qBlue(a) * m + qBlue(b) * (1.0 - m))),
+                           static_cast<int>(std::lround(qAlpha(a) * m + qAlpha(b) * (1.0 - m))));
         }
     }
 
-    // Build from the second-coarsest level down to level 0.
-    for (int level = levels.size() - 2; level >= 0; --level) {
-        const Level& l = levels[level];
-        const int cw = width >> level;
-        const int ch = height >> level;
-        QVector<QRgb> up(static_cast<size_t>(cw) * ch);
-
-        // Upsample acc (which is 2x smaller than this level) bilinear.
-        const int uw = cw / 2;
-        const int uh = ch / 2;
+    // Bilinear upsample of one level onto the next finer grid. Every source is
+    // upsampled on its own: a detail band has to be measured against the same
+    // copy's coarse level, never against the running blend.
+    const auto upsampleTo = [](const QVector<QRgb>& src, int uw, int uh, int cw, int ch) {
+        QVector<QRgb> out(static_cast<size_t>(cw) * ch);
         for (int y = 0; y < ch; ++y) {
             const double sy = y * 0.5 - 0.25;
             const int y0 = wrapIndex(static_cast<int>(std::floor(sy)), uh);
@@ -575,58 +1020,71 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
                 const int x0 = wrapIndex(static_cast<int>(std::floor(sx)), uw);
                 const int x1 = wrapIndex(x0 + 1, uw);
                 const double fx = std::clamp(sx - std::floor(sx), 0.0, 1.0);
-                const QRgb p00 = acc[y0 * uw + x0];
-                const QRgb p10 = acc[y0 * uw + x1];
-                const QRgb p01 = acc[y1 * uw + x0];
-                const QRgb p11 = acc[y1 * uw + x1];
+                const QRgb p00 = src[y0 * uw + x0];
+                const QRgb p10 = src[y0 * uw + x1];
+                const QRgb p01 = src[y1 * uw + x0];
+                const QRgb p11 = src[y1 * uw + x1];
                 auto mix = [&](double v00, double v10, double v01, double v11) {
                     return v00 * (1.0 - fx) * (1.0 - fy) + v10 * fx * (1.0 - fy)
                          + v01 * (1.0 - fx) * fy + v11 * fx * fy;
                 };
-                const double r = mix(qRed(p00), qRed(p10), qRed(p01), qRed(p11));
-                const double g = mix(qGreen(p00), qGreen(p10), qGreen(p01), qGreen(p11));
-                const double b = mix(qBlue(p00), qBlue(p10), qBlue(p01), qBlue(p11));
-                const double a = mix(qAlpha(p00), qAlpha(p10), qAlpha(p01), qAlpha(p11));
-                up[y * cw + x] = qRgba(static_cast<int>(std::round(r)),
-                                       static_cast<int>(std::round(g)),
-                                       static_cast<int>(std::round(b)),
-                                       static_cast<int>(std::round(a)));
+                out[y * cw + x] = qRgba(
+                    static_cast<int>(std::round(mix(qRed(p00), qRed(p10), qRed(p01), qRed(p11)))),
+                    static_cast<int>(std::round(mix(qGreen(p00), qGreen(p10), qGreen(p01), qGreen(p11)))),
+                    static_cast<int>(std::round(mix(qBlue(p00), qBlue(p10), qBlue(p01), qBlue(p11)))),
+                    static_cast<int>(std::round(mix(qAlpha(p00), qAlpha(p10), qAlpha(p01), qAlpha(p11)))));
             }
         }
+        return out;
+    };
+
+    // Build from the second-coarsest level down to level 0.
+    for (int level = levels.size() - 2; level >= 0; --level) {
+        const Level& l = levels[level];
+        const Level& coarser = levels[level + 1];
+        const int cw = width >> level;
+        const int ch = height >> level;
+        const int uw = cw / 2;
+        const int uh = ch / 2;
+
+        const QVector<QRgb> upAcc = upsampleTo(acc, uw, uh, cw, ch);
+        const QVector<QRgb> upI = upsampleTo(coarser.i, uw, uh, cw, ch);
+        const QVector<QRgb> upS = upsampleTo(coarser.s, uw, uh, cw, ch);
 
         // acc grows from the coarsest size to this level's size as we go up the
-        // pyramid. The upsample above only read the old (2x smaller) buffer, so
-        // it is safe to grow it here before writing the blended band back.
+        // pyramid. The upsamples above only read the old (2x smaller) buffers,
+        // so it is safe to grow it here before writing the blended band back.
         acc.resize(static_cast<size_t>(cw) * ch);
 
-        // Detail band = this level minus upsampled coarser content. Blend the
-        // detail from "original" with the detail from "shifted" via the mask,
-        // then add it onto the upsampled accumulator.
+        // Detail band = this level minus *this copy's* upsampled coarser level.
+        // Blend the two bands via the mask, then add them onto the upsampled
+        // accumulator.
+        //
+        // Subtracting the running blend here instead - which is what this used
+        // to do - cancels itself out one level later:
+        //   up + m*(i-up) + (1-m)*(s-up) == m*i + (1-m)*s
+        // so every level threw away the one above it and the whole pyramid
+        // collapsed into a single crossfade over the three-pixel mask. On a
+        // texture carrying a lighting gradient that left the two half-shifted
+        // copies sitting side by side as a visible 2x2 checkerboard.
         for (int y = 0; y < ch; ++y) {
             for (int x = 0; x < cw; ++x) {
-                const QRgb mi = l.mask[y * cw + x];
-                const double m = qRed(mi) / 255.0; // mask value 0..1
-                const QRgb pi = l.i[y * cw + x];
-                const QRgb ps = l.s[y * cw + x];
-                const QRgb pu = up[y * cw + x];
-                auto band = [&](int p, int u) { return p - u; };
-                const double dI_r = band(qRed(pi), qRed(pu));
-                const double dI_g = band(qGreen(pi), qGreen(pu));
-                const double dI_b = band(qBlue(pi), qBlue(pu));
-                const double dI_a = band(qAlpha(pi), qAlpha(pu));
-                const double dS_r = band(qRed(ps), qRed(pu));
-                const double dS_g = band(qGreen(ps), qGreen(pu));
-                const double dS_b = band(qBlue(ps), qBlue(pu));
-                const double dS_a = band(qAlpha(ps), qAlpha(pu));
-                const double blend_r = dI_r * m + dS_r * (1.0 - m);
-                const double blend_g = dI_g * m + dS_g * (1.0 - m);
-                const double blend_b = dI_b * m + dS_b * (1.0 - m);
-                const double blend_a = dI_a * m + dS_a * (1.0 - m);
-                acc[y * cw + x] = qRgba(
-                    static_cast<int>(std::clamp(qRed(pu) + blend_r, 0.0, 255.0)),
-                    static_cast<int>(std::clamp(qGreen(pu) + blend_g, 0.0, 255.0)),
-                    static_cast<int>(std::clamp(qBlue(pu) + blend_b, 0.0, 255.0)),
-                    static_cast<int>(std::clamp(qAlpha(pu) + blend_a, 0.0, 255.0)));
+                const int idx = y * cw + x;
+                const double m = qRed(l.mask[idx]) / 255.0; // mask value 0..1
+                const QRgb pi = l.i[idx];
+                const QRgb ps = l.s[idx];
+                const QRgb ui = upI[idx];
+                const QRgb us = upS[idx];
+                const QRgb ua = upAcc[idx];
+                const double blend_r = (qRed(pi) - qRed(ui)) * m + (qRed(ps) - qRed(us)) * (1.0 - m);
+                const double blend_g = (qGreen(pi) - qGreen(ui)) * m + (qGreen(ps) - qGreen(us)) * (1.0 - m);
+                const double blend_b = (qBlue(pi) - qBlue(ui)) * m + (qBlue(ps) - qBlue(us)) * (1.0 - m);
+                const double blend_a = (qAlpha(pi) - qAlpha(ui)) * m + (qAlpha(ps) - qAlpha(us)) * (1.0 - m);
+                acc[idx] = qRgba(
+                    static_cast<int>(std::clamp(qRed(ua) + blend_r, 0.0, 255.0)),
+                    static_cast<int>(std::clamp(qGreen(ua) + blend_g, 0.0, 255.0)),
+                    static_cast<int>(std::clamp(qBlue(ua) + blend_b, 0.0, 255.0)),
+                    static_cast<int>(std::clamp(qAlpha(ua) + blend_a, 0.0, 255.0)));
             }
         }
     }
@@ -640,6 +1098,462 @@ QImage TextureGenerator::makeSeamless(const QImage& image)
         }
     }
     return output;
+}
+
+// The seam band, synthesized from the rest of the picture.
+//
+// Only the band around the wrap boundary is replaced: everywhere else the
+// photograph survives untouched, which is the difference between this and a
+// full synthesis pass. The band is wide enough that patches sitting on the seam
+// have known content to match on both sides, and narrow enough that the
+// picture the user supplied is still what they see.
+static QImage seamlessAxisPatch(const QImage& image, SeamAxis axis, const PatchSynthOptions& options)
+{
+    const bool horizontal = axis == SeamAxis::Horizontal;
+    const int w = image.width();
+    const int h = image.height();
+    const int along = axis == SeamAxis::Horizontal ? w : h;
+    // Ten percent of the short side, clamped: under ~32px there is too little
+    // context for the match to be meaningful, over ~192 it starts replacing
+    // content the eye would notice missing.
+    const int band = std::clamp(std::min(w, h) / 10, 16, 192);
+
+    // Only the *left* side of the wrap is rewritten, not both sides. The two
+    // borders of a filled band are what decide whether it looks pasted, and one
+    // side of a one-sided band is the picture's own edge: with a wrapped search
+    // the match at x=0 sees x=w-1..w-R as known context, so the fill is pulled
+    // into agreement with the edge it has to join. Rewriting both sides leaves
+    // the wrap seam between two synthesized pixels with nothing to agree on -
+    // measured 29 levels of step on a gradient, where this gives 0.
+    QImage mask(w, h, QImage::Format_Grayscale8);
+    mask.fill(0);
+    for (int y = 0; y < h; ++y) {
+        uchar* line = mask.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            const int coord = axis == SeamAxis::Horizontal ? x : y;
+            if (coord < band) {
+                line[x] = 255;
+            }
+        }
+    }
+    QImage filled = patchSynthesis(image, mask, options);
+    if (filled.isNull()) {
+        return filled;
+    }
+
+    // The patch that filled the band came from somewhere else in the picture,
+    // so it arrives at that place's brightness, not this one's. On a smooth ramp
+    // that is a step where the band meets the photograph - measured 13 levels
+    // with the copy mode and 32 with GPNN, and 48 at the wrap.
+    if (band * 2 < along) {
+        const QImage original = image.convertToFormat(QImage::Format_ARGB32);
+        QImage output = filled.convertToFormat(QImage::Format_ARGB32);
+        const int across = horizontal ? output.height() : output.width();
+        auto pixelAt = [&](const QImage& img, int a, int c) {
+            return horizontal ? img.pixel(a, c) : img.pixel(c, a);
+        };
+        // Re-level by membrane subtraction, the Poisson way.
+        //
+        // The fill arrives at whatever brightness its patches came from, so it
+        // does not meet the photograph on either side of the band. Both sides
+        // are known: the band's inner edge touches the photo at `band`, and its
+        // outer edge touches the photo's last column through the wrap. Build
+        // the smooth surface the photo asks for (a straight ramp between those
+        // two boundaries per line), build the one the fill only thinks it wants
+        // (a straight ramp between the fill's own two edges), and hand the fill
+        // back with the difference of the two added. The fill's detail - the
+        // part that is not its own membrane, i.e. everything the patch match
+        // was for - survives untouched, and both of its borders land exactly on
+        // the photo by construction (at a=0 and a=band-1 the detail term is
+        // zero). Measured on a gradient: 48 levels of seam at the wrap before,
+        // 0 after.
+        // Both ends have to be exact, not smoothed: a=0 becomes the photo's
+        // last column and a=band-1 its pixel at `band`, and that equality *is*
+        // the continuity. Smoothing the ends along c (which an earlier version
+        // did to keep noise out of the ramp) put 5 levels back into the seam
+        // wherever the fill's edge happened to disagree with its neighbours.
+        auto boundary = [&](const QImage& img, int a, int c, int ch) {
+            const QRgb px = pixelAt(img, a, c);
+            return static_cast<double>(ch == 0 ? qRed(px) : ch == 1 ? qGreen(px) : qBlue(px));
+        };
+        // Snapshot the fill's own edges first: the loop overwrites them as it
+        // goes, and the ramp needs the values the synthesis produced.
+        std::vector<float> fillStart(static_cast<size_t>(across) * 3, 0.0f);
+        std::vector<float> fillEnd(fillStart.size(), 0.0f);
+        for (int c = 0; c < across; ++c) {
+            for (int ch = 0; ch < 3; ++ch) {
+                fillStart[static_cast<size_t>(c) * 3 + ch] = boundary(output, 0, c, ch);
+                fillEnd[static_cast<size_t>(c) * 3 + ch] = boundary(output, band - 1, c, ch);
+            }
+        }
+        for (int a = 0; a < band; ++a) {
+            const double t = band > 1 ? static_cast<double>(a) / (band - 1) : 1.0;
+            for (int c = 0; c < across; ++c) {
+                const QRgb base = pixelAt(output, a, c);
+                int rgb[3] = { qRed(base), qGreen(base), qBlue(base) };
+                for (int ch = 0; ch < 3; ++ch) {
+                    const double photoRamp = boundary(original, along - 1, c, ch) * (1.0 - t)
+                                           + boundary(original, band, c, ch) * t;
+                    const double fillRamp = fillStart[static_cast<size_t>(c) * 3 + ch] * (1.0 - t)
+                                          + fillEnd[static_cast<size_t>(c) * 3 + ch] * t;
+                    const double value = rgb[ch] + photoRamp - fillRamp;
+                    rgb[ch] = std::clamp(static_cast<int>(std::lround(value)), 0, 255);
+                }
+                const QRgb value = qRgba(rgb[0], rgb[1], rgb[2], qAlpha(base));
+                if (horizontal) {
+                    output.setPixel(a, c, value);
+                } else {
+                    output.setPixel(c, a, value);
+                }
+            }
+        }
+        return output;
+    }
+    return filled;
+}
+
+// Poisson-style level correction for an arbitrary hole.
+//
+// The synthesis fills a hole with patches that came from somewhere else, so the
+// fill sits at *that* place's brightness and steps where it meets the picture.
+// The only thing that has to be true is that the border closes; what is inside
+// is free. So solve for a smooth correction g that equals (photo - fill) on the
+// ring of hole pixels touching known content, add it back, and the border lands
+// exactly on the photo while the fill's detail - which g, being smooth, does
+// not touch - survives. For a band the solution is a straight ramp and this is
+// the one-dimensional case; for the cross-shaped hole the Resynthesizer mode
+// leaves, nothing one-dimensional exists at all.
+//
+// Solved coarse to fine: a plain relaxation on a 100-pixel-wide hole needs tens
+// of thousands of sweeps, and each level here starts from the level below's
+// answer, so sixty sweeps per level is enough.
+void levelCorrectHole(QImage& filled, const QImage& photo, const QImage& mask, bool wrap)
+{
+    const int w = filled.width();
+    const int h = filled.height();
+    if (w < 4 || h < 4) {
+        return;
+    }
+    std::vector<unsigned char> hole(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; ++y) {
+        const uchar* line = mask.constScanLine(y);
+        for (int x = 0; x < w; ++x) {
+            hole[static_cast<size_t>(y) * w + x] = line[x] > 127 ? 1 : 0;
+        }
+    }
+
+    struct Correction
+    {
+        int w = 0;
+        int h = 0;
+        std::vector<float> value;           // three per pixel
+        std::vector<unsigned char> fixed;   // ring pixel, value given
+        std::vector<unsigned char> hole;
+    };
+
+    Correction finest;
+    finest.w = w;
+    finest.h = h;
+    finest.value.assign(static_cast<size_t>(w) * h * 3, 0.0f);
+    finest.fixed.assign(static_cast<size_t>(w) * h, 0);
+    finest.hole = hole;
+
+    bool anyFixed = false;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t index = static_cast<size_t>(y) * w + x;
+            if (hole[index] == 0) {
+                continue;
+            }
+            const QRgb fillPixel = filled.pixel(x, y);
+            double sum[3] = { 0.0, 0.0, 0.0 };
+            int count = 0;
+            const int nx[4] = { x - 1, x + 1, x, x };
+            const int ny[4] = { y, y, y - 1, y + 1 };
+            for (int k = 0; k < 4; ++k) {
+                int xx = nx[k];
+                int yy = ny[k];
+                if (xx < 0 || yy < 0 || xx >= w || yy >= h) {
+                    if (!wrap) {
+                        continue;
+                    }
+                    xx = wrapIndex(xx, w);
+                    yy = wrapIndex(yy, h);
+                }
+                if (hole[static_cast<size_t>(yy) * w + xx] != 0) {
+                    continue;
+                }
+                const QRgb known = photo.pixel(xx, yy);
+                sum[0] += qRed(known) - qRed(fillPixel);
+                sum[1] += qGreen(known) - qGreen(fillPixel);
+                sum[2] += qBlue(known) - qBlue(fillPixel);
+                ++count;
+            }
+            if (count == 0) {
+                continue;
+            }
+            finest.value[index * 3 + 0] = static_cast<float>(sum[0] / count);
+            finest.value[index * 3 + 1] = static_cast<float>(sum[1] / count);
+            finest.value[index * 3 + 2] = static_cast<float>(sum[2] / count);
+            finest.fixed[index] = 1;
+            anyFixed = true;
+        }
+    }
+    if (!anyFixed) {
+        return;
+    }
+
+    std::vector<Correction> levels;
+    levels.push_back(std::move(finest));
+    while (levels.back().w >= 16 && levels.back().h >= 16 && levels.size() < 4) {
+        const Correction& src = levels.back();
+        Correction next;
+        next.w = std::max(1, src.w / 2);
+        next.h = std::max(1, src.h / 2);
+        next.value.assign(static_cast<size_t>(next.w) * next.h * 3, 0.0f);
+        next.fixed.assign(static_cast<size_t>(next.w) * next.h, 0);
+        next.hole.assign(static_cast<size_t>(next.w) * next.h, 0);
+        for (int y = 0; y < next.h; ++y) {
+            for (int x = 0; x < next.w; ++x) {
+                const size_t di = static_cast<size_t>(y) * next.w + x;
+                double sum[3] = { 0.0, 0.0, 0.0 };
+                double weight = 0.0;
+                bool anyHole = false;
+                bool anyFixed2 = false;
+                for (int dy = 0; dy < 2; ++dy) {
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const int sx = std::min(src.w - 1, x * 2 + dx);
+                        const int sy = std::min(src.h - 1, y * 2 + dy);
+                        const size_t si = static_cast<size_t>(sy) * src.w + sx;
+                        anyHole = anyHole || src.hole[si] != 0;
+                        if (src.fixed[si] == 0) {
+                            continue;
+                        }
+                        anyFixed2 = true;
+                        for (int c = 0; c < 3; ++c) {
+                            sum[c] += src.value[si * 3 + c];
+                        }
+                        weight += 1.0;
+                    }
+                }
+                next.hole[di] = anyHole ? 1 : 0;
+                if (!anyFixed2) {
+                    continue;
+                }
+                next.fixed[di] = 1;
+                for (int c = 0; c < 3; ++c) {
+                    next.value[di * 3 + c] = static_cast<float>(sum[c] / weight);
+                }
+            }
+        }
+        levels.push_back(std::move(next));
+    }
+
+    auto relax = [](Correction& level, int sweeps) {
+        std::vector<float> next(level.value.size(), 0.0f);
+        for (int sweep = 0; sweep < sweeps; ++sweep) {
+            next = level.value;
+            for (int y = 0; y < level.h; ++y) {
+                for (int x = 0; x < level.w; ++x) {
+                    const size_t index = static_cast<size_t>(y) * level.w + x;
+                    if (level.hole[index] == 0 || level.fixed[index] != 0) {
+                        continue;
+                    }
+                    float sum[3] = { 0.0f, 0.0f, 0.0f };
+                    int count = 0;
+                    const int nx[4] = { x - 1, x + 1, x, x };
+                    const int ny[4] = { y, y, y - 1, y + 1 };
+                    for (int k = 0; k < 4; ++k) {
+                        if (nx[k] < 0 || ny[k] < 0 || nx[k] >= level.w || ny[k] >= level.h) {
+                            continue;
+                        }
+                        const size_t ni = static_cast<size_t>(ny[k]) * level.w + nx[k];
+                        if (level.hole[ni] == 0) {
+                            continue;
+                        }
+                        sum[0] += level.value[ni * 3 + 0];
+                        sum[1] += level.value[ni * 3 + 1];
+                        sum[2] += level.value[ni * 3 + 2];
+                        ++count;
+                    }
+                    if (count == 0) {
+                        continue;
+                    }
+                    next[index * 3 + 0] = sum[0] / count;
+                    next[index * 3 + 1] = sum[1] / count;
+                    next[index * 3 + 2] = sum[2] / count;
+                }
+            }
+            std::swap(level.value, next);
+        }
+    };
+
+    relax(levels.back(), 400);
+    for (size_t index = levels.size() - 1; index-- > 0;) {
+        Correction& coarser = levels[index + 1];
+        Correction& level = levels[index];
+        // Bilinear from the coarser answer, then let the finer ring values pull
+        // it into place.
+        Correction seeded = level;
+        for (int y = 0; y < level.h; ++y) {
+            const float fy = (y + 0.5f) * 0.5f - 0.5f;
+            const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, coarser.h - 1);
+            const int y1 = std::min(coarser.h - 1, y0 + 1);
+            const float ty = std::clamp(fy - y0, 0.0f, 1.0f);
+            for (int x = 0; x < level.w; ++x) {
+                const float fx = (x + 0.5f) * 0.5f - 0.5f;
+                const int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, coarser.w - 1);
+                const int x1 = std::min(coarser.w - 1, x0 + 1);
+                const float tx = std::clamp(fx - x0, 0.0f, 1.0f);
+                const size_t di = static_cast<size_t>(y) * level.w + x;
+                if (level.hole[di] == 0 || level.fixed[di] != 0) {
+                    continue;
+                }
+                const size_t i00 = (static_cast<size_t>(y0) * coarser.w + x0) * 3;
+                const size_t i10 = (static_cast<size_t>(y0) * coarser.w + x1) * 3;
+                const size_t i01 = (static_cast<size_t>(y1) * coarser.w + x0) * 3;
+                const size_t i11 = (static_cast<size_t>(y1) * coarser.w + x1) * 3;
+                for (int c = 0; c < 3; ++c) {
+                    const float top = coarser.value[i00 + c] * (1.0f - tx) + coarser.value[i10 + c] * tx;
+                    const float bottom = coarser.value[i01 + c] * (1.0f - tx) + coarser.value[i11 + c] * tx;
+                    seeded.value[di * 3 + c] = top * (1.0f - ty) + bottom * ty;
+                }
+            }
+        }
+        relax(seeded, 60);
+        level.value = seeded.value;
+    }
+
+    QImage out = filled.convertToFormat(QImage::Format_ARGB32);
+    const Correction& full = levels.front();
+    for (int y = 0; y < h; ++y) {
+        QRgb* line = reinterpret_cast<QRgb*>(out.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const size_t index = static_cast<size_t>(y) * w + x;
+            if (hole[index] == 0) {
+                continue;
+            }
+            const QRgb base = line[x];
+            line[x] = qRgba(
+                std::clamp(static_cast<int>(std::lround(qRed(base) + full.value[index * 3 + 0])), 0, 255),
+                std::clamp(static_cast<int>(std::lround(qGreen(base) + full.value[index * 3 + 1])), 0, 255),
+                std::clamp(static_cast<int>(std::lround(qBlue(base) + full.value[index * 3 + 2])), 0, 255),
+                qAlpha(base));
+        }
+    }
+    filled = out;
+}
+
+// Seamless tiling, as two one-axis passes.
+//
+// The second pass runs on the output of the first. That is safe: shifting and
+// pouring along y keeps every row's left-to-right continuity exactly as the
+// first pass left it, so the horizontal tiling survives the vertical pass.
+QImage TextureGenerator::makeSeamless(const QImage& image, SeamlessMode mode)
+{
+    if (image.isNull()) {
+        return image;
+    }
+    if (mode == SeamlessMode::Mirror) {
+        // Fold each axis onto its own first half. The result is symmetric about
+        // both centres, and a symmetric tile wraps exactly: the first column
+        // equals the last by the fold, the second equals the second-to-last, and
+        // so on. No synthesis, no blur, nothing invented - the detail is the
+        // picture's own, at the price of the mirror axis showing as a pattern.
+        const QImage src = image.convertToFormat(QImage::Format_ARGB32);
+        const int w = src.width();
+        const int h = src.height();
+        QImage folded(w, h, QImage::Format_ARGB32);
+        for (int y = 0; y < h; ++y) {
+            const int sy = y < h / 2 ? y : h - 1 - y;
+            const QRgb* in = reinterpret_cast<const QRgb*>(src.constScanLine(sy));
+            QRgb* out = reinterpret_cast<QRgb*>(folded.scanLine(y));
+            for (int x = 0; x < w; ++x) {
+                out[x] = in[x < w / 2 ? x : w - 1 - x];
+            }
+        }
+        return folded;
+    }
+    if (mode == SeamlessMode::Resynthesizer) {
+        // GIMP's Make Seamless. Rolling by half puts the wrap where the middle
+        // of the picture used to be, so the discontinuity the user is trying to
+        // hide is now a cross through the centre with real content on all four
+        // of its sides - a much better posed search than a band pinned to the
+        // edge. Roll in, fill the cross, roll back out.
+        const QImage src = image.convertToFormat(QImage::Format_ARGB32);
+        const int w = src.width();
+        const int h = src.height();
+        const int halfX = w / 2;
+        const int halfY = h / 2;
+        QImage rolled(w, h, QImage::Format_ARGB32);
+        for (int y = 0; y < h; ++y) {
+            const QRgb* in = reinterpret_cast<const QRgb*>(src.constScanLine((y + halfY) % h));
+            QRgb* out = reinterpret_cast<QRgb*>(rolled.scanLine(y));
+            for (int x = 0; x < w; ++x) {
+                out[x] = in[(x + halfX) % w];
+            }
+        }
+        const int band = std::clamp(std::min(w, h) / 10, 16, 192);
+        if (band * 2 >= std::min(w, h)) {
+            return image;
+        }
+        QImage mask(w, h, QImage::Format_Grayscale8);
+        mask.fill(0);
+        for (int y = 0; y < h; ++y) {
+            uchar* line = mask.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                const bool inColumn = x >= halfX - band / 2 && x < halfX + band / 2;
+                const bool inRow = y >= halfY - band / 2 && y < halfY + band / 2;
+                if (inColumn || inRow) {
+                    line[x] = 255;
+                }
+            }
+        }
+        PatchSynthOptions options;
+        options.vote = true; // the cross is wide; averaging is what holds it together
+        options.multiscale = true;
+        options.iterations = 3;
+        QImage filled = patchSynthesis(rolled, mask, options);
+        if (filled.isNull()) {
+            return image;
+        }
+        // The synthesised cross comes from patches elsewhere in the picture, so
+        // it arrives at that place's brightness and steps where it meets the
+        // four sides. Close the border with the harmonic correction rather than
+        // returning the step: for a band it would reduce to the same ramp the
+        // other modes use, but here the hole has no one-dimensional answer.
+        levelCorrectHole(filled, rolled, mask, false);
+        const QImage flat = filled.convertToFormat(QImage::Format_ARGB32);
+        QImage restored(w, h, QImage::Format_ARGB32);
+        for (int y = 0; y < h; ++y) {
+            const QRgb* in = reinterpret_cast<const QRgb*>(flat.constScanLine(y));
+            QRgb* out = reinterpret_cast<QRgb*>(restored.scanLine((y - halfY + h) % h));
+            for (int x = 0; x < w; ++x) {
+                out[(x - halfX + w) % w] = in[x];
+            }
+        }
+        return restored;
+    }
+    if (mode != SeamlessMode::Blend) {
+        PatchSynthOptions options;
+        options.wrap = true; // the band wraps across the seam by definition
+        options.vote = mode == SeamlessMode::Gpnn;
+        // Both modes run the pyramid. The difference between them is how a
+        // pixel's patch is written back (best copy vs. average of every patch
+        // over it), not how the search is organised: a flat search over a band
+        // wider than the patch is the case patch match handles worst, and
+        // measured 5.6 dB on the checkerboard where the pyramid gives 38.
+        options.multiscale = true;
+        options.iterations = mode == SeamlessMode::Gpnn ? 3 : 4;
+        const QImage horizontal = seamlessAxisPatch(image, SeamAxis::Horizontal, options);
+        const QImage verticalInput = horizontal.isNull() ? image : horizontal;
+        const QImage both = seamlessAxisPatch(verticalInput, SeamAxis::Vertical, options);
+        return both.isNull() ? verticalInput : both;
+    }
+    const QImage horizontal = seamlessAxis(image, SeamAxis::Horizontal);
+    const QImage verticalInput = horizontal.isNull() ? image : horizontal;
+    const QImage both = seamlessAxis(verticalInput, SeamAxis::Vertical);
+    return both.isNull() ? verticalInput : both;
 }
 
 // Convert an image into an anime / cell-shaded base color:
@@ -842,28 +1756,65 @@ QImage TextureGenerator::createNormalMap(const HeightField& heightMap, double st
         return normal;
     }
 
-    const double scale = backendMode == TextureBackendMode::EnhancedDetail ? strength * 2.35 : strength * 2.0;
+    // Auto-levels on the height field, then a fixed gain. Normalising in the
+    // height domain (rather than scaling by the slope distribution) is what
+    // makes the result depend on the slider and the surface shape rather than
+    // on how much contrast the photograph happened to have. see heightLevels()
+    // for why the stretch is capped; the precision regression in
+    // tg_height_precision measures exactly that cap.
+    const HeightLevels levels = heightLevels(heightMap);
+    const double low = levels.low;
+    const double stretch = levels.stretch;
 
     auto sample = [&](int x, int y) {
+        double value = 0.0;
         if (wrap) {
-            return static_cast<double>(heightMap.at(wrapIndex(x, width), wrapIndex(y, height)));
+            value = static_cast<double>(heightMap.at(wrapIndex(x, width), wrapIndex(y, height)));
+        } else {
+            value = static_cast<double>(heightMap.at(std::clamp(x, 0, width - 1), std::clamp(y, 0, height - 1)));
         }
-        return static_cast<double>(heightMap.at(std::clamp(x, 0, width - 1), std::clamp(y, 0, height - 1)));
+        return (value - low) * stretch;
     };
+
+    // Sobel 3x3. A divisor of 4 keeps the magnitude comparable to the plain
+    // central difference the first version used.
+    auto gradient = [&](int x, int y, double& gx, double& gy) {
+        gx = (sample(x + 1, y - 1) + 2.0 * sample(x + 1, y) + sample(x + 1, y + 1))
+           - (sample(x - 1, y - 1) + 2.0 * sample(x - 1, y) + sample(x - 1, y + 1));
+        gy = (sample(x - 1, y + 1) + 2.0 * sample(x, y + 1) + sample(x + 1, y + 1))
+           - (sample(x - 1, y - 1) + 2.0 * sample(x, y - 1) + sample(x + 1, y - 1));
+        gx /= 4.0;
+        gy /= 4.0;
+    };
+
+    // Fixed gain, as a height-to-normal tool has always had it. What used to
+    // be here normalised the *slope* distribution (mapping its 90th percentile
+    // to a target angle, then clamping the result to at most six times a fixed
+    // gain). That did make a flat photo respond to the slider, but it meant the
+    // slider's absolute meaning still depended on the source, and on a noisy
+    // image it amplified the noise into relief. The stretch above already
+    // removes the source-contrast dependence, so this is a plain multiplier:
+    // for a normally-exposed photo it gives the same relief the old lower bound
+    // did, and the slider now means the same thing on every image.
+    const double clampedStrength = std::clamp(strength, 0.0, 3.0);
+    const double gain = clampedStrength * (backendMode == TextureBackendMode::EnhancedDetail ? 2.35 : 2.0);
 
     for (int y = 0; y < height; ++y) {
         QRgb* outLine = reinterpret_cast<QRgb*>(normal.scanLine(y));
         for (int x = 0; x < width; ++x) {
-            // Sobel 3x3 gradient; /4 keeps the strength scale comparable to the
-            // previous central-difference version. Y sign stays aligned with
-            // Blender's tangent-space convention (bright G = slope toward +Y).
-            const double gx = (sample(x + 1, y - 1) + 2.0 * sample(x + 1, y) + sample(x + 1, y + 1))
-                            - (sample(x - 1, y - 1) + 2.0 * sample(x - 1, y) + sample(x - 1, y + 1));
-            const double gy = (sample(x - 1, y + 1) + 2.0 * sample(x, y + 1) + sample(x + 1, y + 1))
-                            - (sample(x - 1, y - 1) + 2.0 * sample(x, y - 1) + sample(x + 1, y - 1));
+            double gx = 0.0;
+            double gy = 0.0;
+            gradient(x, y, gx, gy);
 
-            double nx = -gx * scale / 4.0;
-            double ny = -gy * scale / 4.0;
+            double nx = -gx * gain;
+            // Green follows the OpenGL/Blender convention (v up the image), the
+            // same one the Normal Map node and glTF tangents expect. The row
+            // index runs the other way, so the sign is +gy: a Blender bake of a
+            // raised bump has G near 255 on the bump's upper side and near 0 on
+            // its lower side, and -gy produced exactly the reverse - a DirectX
+            // map, which lights inside-out in every Blender material while
+            // looking plausible in isolation.
+            double ny = gy * gain;
             double nz = 1.0;
             const double length = std::sqrt(nx * nx + ny * ny + nz * nz);
             nx /= length;

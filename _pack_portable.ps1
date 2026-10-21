@@ -63,23 +63,37 @@ if (Test-Path $ortLicense) {
     Copy-Item $ortLicense (Join-Path $stage "LICENSE-onnxruntime-MIT.txt") -Force
 }
 
-# 5. tools/ placeholder for the optional Real-ESRGAN upscaler
+# 5. Real-ESRGAN upscaler. It ships inside the package so the upscale button
+#    works offline out of the box; asking users to fetch a 45 MB zip and unpack
+#    it by hand was the single most common thing to go wrong.
 $tools = Join-Path $stage "tools"
 New-Item -ItemType Directory -Force -Path $tools | Out-Null
-@"
+$resrSrc = Join-Path $repo "app\tools\realesrgan-ncnn-vulkan"
+if (Test-Path (Join-Path $resrSrc "realesrgan-ncnn-vulkan.exe")) {
+    Copy-Item $resrSrc (Join-Path $tools "realesrgan-ncnn-vulkan") -Recurse -Force
+}
+else {
+    # A package without the upscaler is still usable, but say so in the archive
+    # instead of leaving an empty folder that looks like a packaging bug.
+    @"
 Real-ESRGAN 超分放大（可选）放置目录。
 
-把 realesrgan-ncnn-vulkan 解压到本目录，使其包含：
+本包没有内置 Real-ESRGAN。要启用"无损放大"，把 realesrgan-ncnn-vulkan 解压到本目录，使其包含：
     tools\realesrgan-ncnn-vulkan\realesrgan-ncnn-vulkan.exe
     tools\realesrgan-ncnn-vulkan\models\...        (realesrgan-x4plus / x4plus-anime)
 
-不放也能正常用软件，只是"无损放大"按钮会提示未找到 Real-ESRGAN。
 下载：https://github.com/xinntao/Real-ESRGAN/releases
    (v0.2.5.0 的 realesrgan-ncnn-vulkan-20220424-windows.zip 即可)
+或者在源码目录运行 app\_get_realesrgan.ps1 后重新打包。
 
-Place the Real-ESRGAN upscaler here (optional). Without it the app works, but
-the upscale button reports the binary is missing. See above for the exact layout.
+This package does not bundle Real-ESRGAN. Unpack it into this folder to enable
+the upscale button; see above for the exact layout.
 "@ | Set-Content -Path (Join-Path $tools "README.txt") -Encoding UTF8
+}
+$resrLicense = Join-Path $repo "app\tools\LICENSE-RealESRGAN-BSD-3-Clause.txt"
+if (Test-Path $resrLicense) {
+    Copy-Item $resrLicense (Join-Path $stage "LICENSE-RealESRGAN-BSD-3-Clause.txt") -Force
+}
 
 # 6. Zip (flat folder, no nested wrapper)
 Add-Type -AssemblyName System.IO.Compression.FileSystem

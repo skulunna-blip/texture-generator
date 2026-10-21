@@ -23,7 +23,7 @@ public:
     enum class PreviewMode
     {
         Full,        // everything as generated
-        NormalOnly,  // plain surface lit only by the normal map
+        NormalOnly,  // the normal map's own RGB, unlit, as CrazyBump/PS show it
         BumpOnly     // plain surface lit only by bump-derived normals
     };
 

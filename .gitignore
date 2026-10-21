@@ -24,6 +24,23 @@ dist/TextureGeneratorQt-portable.zip
 app/models/*.onnx
 app/third_party/onnxruntime/bin/*.dll
 
+# Real-ESRGAN upscaler: 6 MB binary + 42 MB of weights. Fetched with
+# _get_realesrgan.ps1 and copied into the portable package by _pack_portable.ps1.
+app/tools/realesrgan-ncnn-vulkan/
+
 # editor
 .vscode/
 .idea/
+
+# Renders written next to the binaries by the visual checks (rotation sweep,
+# patch synthesis, seam visual, vorient probes). Outputs, not sources.
+/orient.png
+/rot_*.png
+/shape_*.png
+/patch_*.png
+app/orient.png
+app/rot_*.png
+app/shape_*.png
+app/patch_*.png
+app/vorient_*.png
+app/tmptg_window.png

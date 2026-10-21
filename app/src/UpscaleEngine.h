@@ -6,6 +6,8 @@
 #include <QMap>
 #include <QString>
 
+#include <functional>
+
 // Super-resolution for the generated maps using the bundled Real-ESRGAN
 // (realesrgan-ncnn-vulkan). The same model family covers both style modes:
 // realesrgan-x4plus for realistic/photographic maps, realesrgan-x4plus-anime
@@ -31,11 +33,29 @@ public:
     static QString findBinary();
     static bool isAvailable();
 
+    // 0-100 across all maps, plus the name of the map being worked on. The
+    // engine calls it from the worker thread, so a UI receiver has to marshal
+    // to its own thread (QMetaObject::invokeMethod with Qt::QueuedConnection).
+    using ProgressCallback = std::function<void(int percent, const QString& label)>;
+
     // Upscales every map in sourceFiles into <outputRoot>/upscaled_<scale>x/
     // and returns the new maps. Blocking call; run it in a worker thread from
     // the UI.
     static Result upscale(const QMap<QString, QString>& sourceFiles,
                           const QString& outputRoot,
                           int scale,
-                          StyleMode style);
+                          StyleMode style,
+                          ProgressCallback progress = {});
+
+    // One image, which is what the app uses: the source the user dropped in is
+    // enlarged once, and every map is then generated from that. Scaling the
+    // maps afterwards would invent detail in AO and roughness, where invented
+    // detail is the last thing you want, and it would redo the same inference
+    // six times.
+    static bool upscaleImage(const QString& sourcePath,
+                             const QString& outputPath,
+                             int scale,
+                             StyleMode style,
+                             const ProgressCallback& progress = {},
+                             QString* error = nullptr);
 };

@@ -50,6 +50,51 @@ double meanLuma(const QImage& image)
     return total / (static_cast<double>(image.width()) * image.height());
 }
 
+// Per-channel PSNR after matching each channel's mean. The luma-only version
+// below cannot see a hue that has been dragged toward grey, which is exactly
+// the failure a luminance-driven shading estimate has on coloured albedo.
+double psnrRgbMeanMatched(const QImage& a, const QImage& b)
+{
+    if (a.size() != b.size() || a.isNull() || b.isNull()) {
+        return -1.0;
+    }
+    double meanA[3] = {0.0, 0.0, 0.0};
+    double meanB[3] = {0.0, 0.0, 0.0};
+    const double pixels = static_cast<double>(a.width()) * a.height();
+    for (int y = 0; y < a.height(); ++y) {
+        for (int x = 0; x < a.width(); ++x) {
+            const QRgb pa = a.pixel(x, y);
+            const QRgb pb = b.pixel(x, y);
+            meanA[0] += qRed(pa) / 255.0;
+            meanA[1] += qGreen(pa) / 255.0;
+            meanA[2] += qBlue(pa) / 255.0;
+            meanB[0] += qRed(pb) / 255.0;
+            meanB[1] += qGreen(pb) / 255.0;
+            meanB[2] += qBlue(pb) / 255.0;
+        }
+    }
+    for (int c = 0; c < 3; ++c) {
+        meanA[c] /= pixels;
+        meanB[c] /= pixels;
+    }
+    double sq = 0.0;
+    for (int y = 0; y < a.height(); ++y) {
+        for (int x = 0; x < a.width(); ++x) {
+            const QRgb pa = a.pixel(x, y);
+            const QRgb pb = b.pixel(x, y);
+            const double av[3] = {qRed(pa) / 255.0, qGreen(pa) / 255.0, qBlue(pa) / 255.0};
+            const double bv[3] = {qRed(pb) / 255.0, qGreen(pb) / 255.0, qBlue(pb) / 255.0};
+            for (int c = 0; c < 3; ++c) {
+                const double shifted = std::clamp(bv[c] + (meanA[c] - meanB[c]), 0.0, 1.0);
+                const double d = av[c] - shifted;
+                sq += d * d;
+            }
+        }
+    }
+    const double mse = sq / (pixels * 3.0);
+    return mse <= 1e-12 ? 99.0 : 10.0 * std::log10(1.0 / mse);
+}
+
 // PSNR after matching mean luminance, so this measures recovered structure
 // rather than the overall exposure (which the pass deliberately preserves).
 double psnrMeanMatched(const QImage& a, const QImage& b)
@@ -127,6 +172,52 @@ Scene makeScene(int size)
     return scene;
 }
 
+// The same scene with saturated *colour* in the albedo.
+//
+// This is the case a luminance-only shading estimate cannot get right and a
+// channel-coupled one can. A blue tile has a third of a white tile's luma while
+// being no darker as a surface, so measuring "how much darker than the
+// neighbourhood" in luma alone reads the blue tile as shadow and brightens it,
+// pulling its hue toward grey. Coupling the channels (take the difference from
+// whichever channel changes most, per pixel) is what Color Retinex adds over
+// the plain luminance form.
+Scene makeColoredScene(int size)
+{
+    Scene scene;
+    scene.albedo = QImage(size, size, QImage::Format_RGB32);
+    scene.photo = QImage(size, size, QImage::Format_RGB32);
+
+    // Four tiles with very different luma for similar surface brightness.
+    const double tiles[4][3] = {
+        {0.86, 0.12, 0.12}, // red
+        {0.10, 0.72, 0.14}, // green
+        {0.10, 0.16, 0.84}, // blue
+        {0.90, 0.88, 0.84}, // white
+    };
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const int tile = ((x / 8) + (y / 8)) % 4;
+            const double ar = tiles[tile][0];
+            const double ag = tiles[tile][1];
+            const double ab = tiles[tile][2];
+
+            const double dx = (x - size * 0.3) / size;
+            const double dy = (y - size * 0.3) / size;
+            const double lobe = 1.0 + 0.85 * std::exp(-(dx * dx + dy * dy) * 6.0);
+            const double shade = lobe * (1.0 - 0.25 * y / size);
+
+            scene.albedo.setPixel(x, y, qRgb(encode(srgbToLinear(ar)),
+                                             encode(srgbToLinear(ag)),
+                                             encode(srgbToLinear(ab))));
+            scene.photo.setPixel(x, y, qRgb(encode(srgbToLinear(ar) * shade),
+                                            encode(srgbToLinear(ag) * shade),
+                                            encode(srgbToLinear(ab) * shade)));
+        }
+    }
+    return scene;
+}
+
 // Same metric as seam_check_main.cpp: mean absolute difference between opposite
 // borders. A wrapped filter drives this down to the interior granularity.
 double edgeDiff(const QImage& image)
@@ -194,6 +285,28 @@ int main(int argc, char** argv)
         std::printf("DELIGHT shading_recovery     %s  psnr photo=%5.2f dB -> delit=%5.2f dB (gain %+5.2f)\n",
                     ok ? "PASS" : "FAIL", before, after, after - before);
         if (!ok) {
+            ++failures;
+        }
+    }
+
+    // --- 2b. Coloured albedo: the case luminance cannot separate ----------
+    {
+        const Scene colored = makeColoredScene(size);
+        const QImage out = LightingRemoval::remove(colored.photo, QImage(), 1.0, false);
+        const double before = psnrRgbMeanMatched(colored.albedo, colored.photo);
+        const double after = psnrRgbMeanMatched(colored.albedo, out);
+        std::printf("DELIGHT colored_recovery     %s  rgb psnr photo=%5.2f dB -> delit=%5.2f dB (gain %+5.2f)\n",
+                    after > before ? "PASS" : "FAIL", before, after, after - before);
+        // Numbers say how much, only an image says what. Set TG_DELIGHT_DUMP to
+        // a directory to write albedo / photo / result side by side.
+        const QByteArray dumpDir = qgetenv("TG_DELIGHT_DUMP");
+        if (!dumpDir.isEmpty()) {
+            const QString base = QString::fromLocal8Bit(dumpDir);
+            colored.albedo.save(base + QStringLiteral("/colored_albedo.png"));
+            colored.photo.save(base + QStringLiteral("/colored_photo.png"));
+            out.save(base + QStringLiteral("/colored_out.png"));
+        }
+        if (!(after > before)) {
             ++failures;
         }
     }
